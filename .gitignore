@@ -4,3 +4,10 @@
 
 IMPLEMENTATION_PLAN.md
 docs/
+
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+*.db
