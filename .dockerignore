@@ -1,0 +1,10 @@
+.env
+.git
+data/
+fixtures/
+__pycache__/
+.venv/
+*.db
+*.bak
+docs/
+IMPLEMENTATION_PLAN.md

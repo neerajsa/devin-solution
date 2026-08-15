@@ -1,0 +1,6 @@
+.env
+.env.local
+.env.*.local
+
+IMPLEMENTATION_PLAN.md
+docs/
