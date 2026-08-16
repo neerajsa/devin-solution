@@ -7,6 +7,7 @@ import json
 import logging
 import os
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 import config
@@ -15,7 +16,9 @@ from dashboard import router as dashboard_router
 from devin import DevinClient
 from github_client import GitHubClient, extract_fingerprint
 from orchestrator import Orchestrator
-from scanners import Finding
+from scanners import Finding, fetch_and_scan
+
+SCAN_TARGETS = ["requirements/base.txt", "requirements/development.txt"]
 
 app = FastAPI(title="Devin Remediation Pipeline")
 logger = logging.getLogger("main")
@@ -51,6 +54,20 @@ def _finding_from_row(row) -> Finding:
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/scan/run")
+async def scan_run(request: Request) -> dict[str, str]:
+    # Not a GitHub-signed webhook - this is our own trigger, called by
+    # scanner/scan.yml (scheduled or workflow_dispatch) on the fork. Reuses
+    # WEBHOOK_SECRET as a bearer token rather than adding a second secret.
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {_cfg.webhook_secret}":
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    run_id = store.start_run(_conn, trigger="scheduled_scan")
+    asyncio.create_task(_scan_and_file(run_id))
+    return {"status": "accepted", "run_id": run_id}
 
 
 @app.post("/webhooks/github")
@@ -136,3 +153,47 @@ async def _dispatch_and_verify(finding: Finding, run_id: str) -> None:
         logger.exception("dispatch/verify failed for run %s", run_id)
     finally:
         store.finish_run(_conn, run_id, findings_count=1, sessions_count=sessions_count)
+
+
+async def _scan_and_file(run_id: str) -> None:
+    # Fire-and-forget background task, same failure-handling shape as
+    # _dispatch_and_verify: any error must still leave the run marked
+    # finished, never NULL forever.
+    findings_count = 0
+    try:
+        async with httpx.AsyncClient() as client:
+            findings = await fetch_and_scan(
+                _cfg.github_repo, "master", SCAN_TARGETS, client=client,
+            )
+        findings_count = len(findings)
+
+        for finding in findings:
+            finding_id = store.insert_finding(
+                _conn, fingerprint=finding.fingerprint, source=finding.source,
+                finding_class=finding.finding_class, severity=finding.severity,
+                summary=finding.summary, package=finding.package,
+                current_version=finding.current_version, fixed_version=finding.fixed_version,
+                cve_id=finding.cve_id, file_path=finding.file_path,
+            )
+            row = store.get_finding(_conn, finding_id)
+            if row["issue_number"] is not None:
+                continue  # already filed on an earlier scan - dedup, don't re-file
+
+            issue = await _github_client.file_issue(
+                title=f"[security] {finding.package}: {finding.cve_id or finding.fingerprint}",
+                body=finding.summary,
+                fingerprint=finding.fingerprint,
+                labels=[],
+            )
+            store.set_finding_issue(
+                _conn, finding_id, issue_number=issue["number"], issue_url=issue["html_url"],
+            )
+            # Labeling separately (not at creation) guarantees a distinct
+            # issues.labeled webhook event, which is what actually triggers
+            # dispatch via the existing _handle_issue_labeled path above -
+            # this function only scans, files, and labels; it doesn't dispatch.
+            await _github_client.label(issue["number"], ["devin-autofix"])
+    except Exception:
+        logger.exception("scan run %s failed", run_id)
+    finally:
+        store.finish_run(_conn, run_id, findings_count=findings_count, sessions_count=0)
