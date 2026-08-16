@@ -179,7 +179,7 @@ class Orchestrator:
             self._conn, session_id=session_id, state="ci_retry_dispatched",
             pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries + 1, terminal=False,
         )
-        return {"session_id": session_id, "state": "ci_retry_dispatched", "pr_url": pr_url}
+        return {"session_id": session_id, "devin_session_id": devin_session_id, "state": "ci_retry_dispatched", "pr_url": pr_url}
 
     async def _finish_ci(self, session_id: str, devin_session_id: str, *, state: str,
                           pr_url: str, ci_conclusion: str, ci_retries: int) -> dict:
@@ -188,7 +188,7 @@ class Orchestrator:
             ci_conclusion=ci_conclusion, ci_retries=ci_retries, terminal=True,
         )
         await self._devin.terminate_session(devin_session_id, archive=True)
-        return {"session_id": session_id, "state": state, "pr_url": pr_url}
+        return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}
 
     async def _finish(self, session_id: str, devin_session_id: str, *, state: str,
                        pr_url: str | None, structured_output: dict | None,
@@ -200,4 +200,4 @@ class Orchestrator:
         )
         if terminate_session:
             await self._devin.terminate_session(devin_session_id, archive=True)
-        return {"session_id": session_id, "state": state, "pr_url": pr_url}
+        return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}
