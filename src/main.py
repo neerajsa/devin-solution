@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 import config
 import store
+from dashboard import router as dashboard_router
 from devin import DevinClient
 from github_client import GitHubClient, extract_fingerprint
 from orchestrator import Orchestrator
@@ -28,6 +29,9 @@ _github_client = GitHubClient(token=_cfg.github_token, repo=_cfg.github_repo)
 _orchestrator = Orchestrator(
     devin_client=_devin_client, github_client=_github_client, conn=_conn, repo=_cfg.github_repo,
 )
+
+app.state.conn = _conn
+app.include_router(dashboard_router)
 
 
 def verify_signature(body: bytes, header: str | None, secret: str) -> bool:

@@ -133,6 +133,7 @@ class Orchestrator:
                         session_id, devin_session_id, state="needs_human", pr_url=pr_url,
                         structured_output=raw.get("structured_output"),
                         human_messages_sent=human_messages_sent,
+                        acu_used=raw.get("acus_consumed") or 0,
                     )
                 await asyncio.sleep(self._poll_interval)
                 continue
@@ -144,6 +145,7 @@ class Orchestrator:
                 session_id, devin_session_id, state=state, pr_url=pr_url,
                 structured_output=raw.get("structured_output"),
                 human_messages_sent=human_messages_sent, terminate_session=terminal,
+                acu_used=raw.get("acus_consumed") or 0,
             )
             return result
 
@@ -157,18 +159,22 @@ class Orchestrator:
         """
         pr_number = pr_number_from_url(pr_url)
         conclusion = await self._github.wait_for_checks(pr_number, timeout=self._ci_timeout)
-        ci_retries = store.get_session(self._conn, session_id)["ci_retries"]
+        row = store.get_session(self._conn, session_id)
+        ci_retries = row["ci_retries"]
+        # Refresh acus_consumed at each CI-verification step so "cost per merged
+        # fix" reflects the full session cost, not just what it was at dispatch time.
+        acu_used = (await self._devin.get_session(devin_session_id)).get("acus_consumed") or 0
 
         if conclusion == "success":
             return await self._finish_ci(
                 session_id, devin_session_id, state="remediated_ci_green",
-                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries,
+                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries, acu_used=acu_used,
             )
 
         if ci_retries >= 1:
             return await self._finish_ci(
                 session_id, devin_session_id, state="ci_red_needs_human",
-                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries,
+                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries, acu_used=acu_used,
             )
 
         log = await self._github.failing_job_log(pr_number)
@@ -177,26 +183,28 @@ class Orchestrator:
         )
         store.upsert_session(
             self._conn, session_id=session_id, state="ci_retry_dispatched",
-            pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries + 1, terminal=False,
+            pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries + 1,
+            acu_used=acu_used, terminal=False,
         )
         return {"session_id": session_id, "devin_session_id": devin_session_id, "state": "ci_retry_dispatched", "pr_url": pr_url}
 
     async def _finish_ci(self, session_id: str, devin_session_id: str, *, state: str,
-                          pr_url: str, ci_conclusion: str, ci_retries: int) -> dict:
+                          pr_url: str, ci_conclusion: str, ci_retries: int, acu_used: float) -> dict:
         store.upsert_session(
             self._conn, session_id=session_id, state=state, pr_url=pr_url,
-            ci_conclusion=ci_conclusion, ci_retries=ci_retries, terminal=True,
+            ci_conclusion=ci_conclusion, ci_retries=ci_retries, acu_used=acu_used, terminal=True,
         )
         await self._devin.terminate_session(devin_session_id, archive=True)
         return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}
 
     async def _finish(self, session_id: str, devin_session_id: str, *, state: str,
                        pr_url: str | None, structured_output: dict | None,
-                       human_messages_sent: int, terminate_session: bool = True) -> dict:
+                       human_messages_sent: int, acu_used: float = 0,
+                       terminate_session: bool = True) -> dict:
         store.upsert_session(
             self._conn, session_id=session_id, state=state, pr_url=pr_url,
             human_messages_sent=human_messages_sent, structured_output=structured_output,
-            terminal=terminate_session,
+            acu_used=acu_used, terminal=terminate_session,
         )
         if terminate_session:
             await self._devin.terminate_session(devin_session_id, archive=True)

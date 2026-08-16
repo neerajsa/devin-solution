@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Devin Remediation Pipeline</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; }
+    .card .label { font-size: 0.85rem; color: #666; }
+    .card .value { font-size: 1.6rem; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+    .seeded { color: #b45309; }
+  </style>
+</head>
+<body>
+  <h1>Devin Remediation Pipeline</h1>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Autonomy rate</div>
+      <div class="value">{{ "%.0f%%"|format(m.autonomy_rate * 100) if m.autonomy_rate is not none else "n/a" }}</div>
+    </div>
+    <div class="card">
+      <div class="label">First-pass CI rate</div>
+      <div class="value">{{ "%.0f%%"|format(m.first_pass_ci_rate * 100) if m.first_pass_ci_rate is not none else "n/a" }}</div>
+    </div>
+    <div class="card">
+      <div class="label">Latency (p50 / p95)</div>
+      <div class="value">
+        {{ "%.0fs"|format(m.latency.p50_seconds) if m.latency.p50_seconds is not none else "n/a" }} /
+        {{ "%.0fs"|format(m.latency.p95_seconds) if m.latency.p95_seconds is not none else "n/a" }}
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">ACU per merged fix</div>
+      <div class="value">{{ "%.1f"|format(m.cost_per_merged_fix.acu_per_merged_fix) if m.cost_per_merged_fix.acu_per_merged_fix is not none else "n/a" }}</div>
+    </div>
+    <div class="card">
+      <div class="label">Backlog by status</div>
+      <div class="value">{% for status, n in m.backlog_burndown.items() %}{{ status }}: {{ n }}&nbsp; {% endfor %}</div>
+    </div>
+    <div class="card">
+      <div class="label">Failure taxonomy</div>
+      <div class="value">{% for state, n in m.failure_taxonomy.items() %}{{ state }}: {{ n }}&nbsp; {% endfor %}</div>
+    </div>
+  </div>
+
+  <h2>Findings</h2>
+  <table>
+    <tr><th>Fingerprint</th><th>Class</th><th>Package</th><th>Severity</th><th>Status</th><th>Issue</th></tr>
+    {% for f in findings %}
+    <tr class="{{ 'seeded' if f.seeded else '' }}">
+      <td>{{ f.fingerprint }}</td>
+      <td>{{ f['class'] }}</td>
+      <td>{{ f.package or '' }}</td>
+      <td>{{ f.severity }}</td>
+      <td>{{ f.status }}</td>
+      <td>{% if f.issue_url %}<a href="{{ f.issue_url }}">#{{ f.issue_number }}</a>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>

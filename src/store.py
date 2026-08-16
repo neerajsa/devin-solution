@@ -59,7 +59,11 @@ CREATE TABLE IF NOT EXISTS deliveries (
 
 
 def connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # FastAPI runs sync `def` routes (e.g. the dashboard) in a threadpool
+    # worker thread, separate from the event-loop thread this connection is
+    # created on - check_same_thread=False allows that cross-thread reuse.
+    # Our own usage is never concurrent enough to need more than this.
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     return conn
