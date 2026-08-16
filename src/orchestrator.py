@@ -13,7 +13,18 @@ import time
 import prompts
 import store
 from devin import DevinClient
+from github_client import GitHubClient
 from scanners import Finding
+
+CI_RETRY_MESSAGE_TEMPLATE = (
+    "CI failed on your PR. Below is the failing job log. Diagnose the "
+    "failure and push a fix to the same branch. Do not open a new PR.\n\n{log}"
+)
+CI_LOG_TRUNCATE_CHARS = 6000
+
+
+def pr_number_from_url(pr_url: str) -> int:
+    return int(pr_url.rstrip("/").rsplit("/", 1)[-1])
 
 TERMINAL_SESSION_STATUS = {"exit", "error"}
 BLOCKED_DETAILS = {"waiting_for_user", "waiting_for_approval"}
@@ -49,16 +60,20 @@ def resolve(session: dict) -> tuple[str, str | None]:
 
 
 class Orchestrator:
-    def __init__(self, *, devin_client: DevinClient, conn, repo: str, branch: str = "master",
+    def __init__(self, *, devin_client: DevinClient, github_client: GitHubClient, conn,
+                 repo: str, branch: str = "master",
                  max_concurrent: int = 4, max_acu_limit: int = 20,
-                 poll_interval: float = 15, blocked_nudge_timeout: float = 300):
+                 poll_interval: float = 15, blocked_nudge_timeout: float = 300,
+                 ci_timeout: float = 900):
         self._devin = devin_client
+        self._github = github_client
         self._conn = conn
         self._repo = repo
         self._branch = branch
         self._max_acu_limit = max_acu_limit
         self._poll_interval = poll_interval
         self._blocked_nudge_timeout = blocked_nudge_timeout
+        self._ci_timeout = ci_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def dispatch(self, finding: Finding, *, run_id: str) -> dict:
@@ -131,6 +146,49 @@ class Orchestrator:
                 human_messages_sent=human_messages_sent, terminate_session=terminal,
             )
             return result
+
+    async def verify_ci(self, *, session_id: str, devin_session_id: str, pr_url: str) -> dict:
+        """"PR opened" is not success; "PR green" is. One retry, same session, then escalate.
+
+        Same session so Devin keeps its context; one retry only so a broken
+        fix can't loop; truncated log to control prompt size; explicit
+        "do not open a new PR" because otherwise the natural agent behavior
+        is to branch again.
+        """
+        pr_number = pr_number_from_url(pr_url)
+        conclusion = await self._github.wait_for_checks(pr_number, timeout=self._ci_timeout)
+        ci_retries = store.get_session(self._conn, session_id)["ci_retries"]
+
+        if conclusion == "success":
+            return await self._finish_ci(
+                session_id, devin_session_id, state="remediated_ci_green",
+                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries,
+            )
+
+        if ci_retries >= 1:
+            return await self._finish_ci(
+                session_id, devin_session_id, state="ci_red_needs_human",
+                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries,
+            )
+
+        log = await self._github.failing_job_log(pr_number)
+        await self._devin.send_message(
+            devin_session_id, CI_RETRY_MESSAGE_TEMPLATE.format(log=log[:CI_LOG_TRUNCATE_CHARS]),
+        )
+        store.upsert_session(
+            self._conn, session_id=session_id, state="ci_retry_dispatched",
+            pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries + 1, terminal=False,
+        )
+        return {"session_id": session_id, "state": "ci_retry_dispatched", "pr_url": pr_url}
+
+    async def _finish_ci(self, session_id: str, devin_session_id: str, *, state: str,
+                          pr_url: str, ci_conclusion: str, ci_retries: int) -> dict:
+        store.upsert_session(
+            self._conn, session_id=session_id, state=state, pr_url=pr_url,
+            ci_conclusion=ci_conclusion, ci_retries=ci_retries, terminal=True,
+        )
+        await self._devin.terminate_session(devin_session_id, archive=True)
+        return {"session_id": session_id, "state": state, "pr_url": pr_url}
 
     async def _finish(self, session_id: str, devin_session_id: str, *, state: str,
                        pr_url: str | None, structured_output: dict | None,
