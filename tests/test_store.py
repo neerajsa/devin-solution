@@ -55,6 +55,28 @@ def test_finding_with_no_cve_fields_works_for_code_quality_class(conn):
     assert row["file_path"] == "superset/utils/date_parser.py"
 
 
+def test_upsert_session_create_requires_finding_devin_id_and_url(conn):
+    with pytest.raises(ValueError, match="required to create"):
+        store.upsert_session(conn, session_id=None, state="working")
+
+
+def test_upsert_session_update_does_not_require_create_only_fields(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="f-update-only", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    session_id = store.upsert_session(
+        conn, session_id=None, finding_id=finding_id,
+        devin_session_id="d1", devin_url="https://app.devin.ai/sessions/d1", state="working",
+    )
+
+    # No finding_id/devin_session_id/devin_url passed here - must not raise.
+    store.upsert_session(conn, session_id=session_id, state="needs_human", terminal=True)
+
+    row = store.get_session(conn, session_id)
+    assert row["state"] == "needs_human"
+
+
 def test_upsert_session_create_then_update(conn):
     finding_id = store.insert_finding(
         conn, fingerprint="f1", source="pip-audit", finding_class="dependency-cve",

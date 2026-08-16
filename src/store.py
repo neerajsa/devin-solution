@@ -116,18 +116,26 @@ def set_finding_issue(conn: sqlite3.Connection, finding_id: str, *,
     conn.commit()
 
 
-def upsert_session(conn: sqlite3.Connection, *, session_id: str | None, finding_id: str,
-                    devin_session_id: str, devin_url: str, state: str,
+def upsert_session(conn: sqlite3.Connection, *, session_id: str | None,
+                    state: str, finding_id: str | None = None,
+                    devin_session_id: str | None = None, devin_url: str | None = None,
                     pr_url: str | None = None, ci_conclusion: str | None = None,
                     ci_retries: int = 0, acu_used: float = 0,
                     human_messages_sent: int = 0,
                     structured_output: dict | None = None,
                     terminal: bool = False) -> str:
-    """Create a session row if session_id is None, otherwise update the existing one."""
+    """Create a session row if session_id is None, otherwise update the existing one.
+
+    finding_id/devin_session_id/devin_url are only required to create a row -
+    an update never touches them, so callers updating an existing session
+    don't need to pass placeholder values for fields that won't be used.
+    """
     now = time.time()
     output_json = json.dumps(structured_output) if structured_output is not None else None
 
     if session_id is None:
+        if not (finding_id and devin_session_id and devin_url):
+            raise ValueError("finding_id, devin_session_id, and devin_url are required to create a session")
         session_id = str(uuid.uuid4())
         conn.execute(
             """INSERT INTO sessions
