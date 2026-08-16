@@ -86,8 +86,19 @@ async def _handle_issue_labeled(payload: dict) -> None:
 
     issue = payload["issue"]
     fingerprint = extract_fingerprint(issue.get("body") or "")
+
     if fingerprint is None:
-        return
+        # No marker means this wasn't filed by our scanner - treat the issue
+        # itself as the finding. The issue number is already a stable, unique
+        # identifier, so no marker needs to be written back into the body.
+        fingerprint = f"github-issue-{issue['number']}"
+        title = issue.get("title") or ""
+        body = issue.get("body") or ""
+        store.insert_finding(
+            _conn, fingerprint=fingerprint, source="github-issue",
+            finding_class="reported-issue", severity="unrated",
+            summary=f"{title}\n\n{body}".strip(),
+        )
 
     finding_row = store.get_finding_by_fingerprint(_conn, fingerprint)
     if finding_row is None:

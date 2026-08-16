@@ -34,6 +34,18 @@ def test_dependency_cve_prompt_with_no_fix_instructs_no_guessing():
     assert "needs_human" in text
 
 
+def test_reported_issue_prompt_instructs_investigation_not_a_prescribed_fix():
+    finding = Finding(
+        fingerprint="github-issue-42", source="github-issue", finding_class="reported-issue",
+        severity="unrated", summary="Previous calendar quarter is off by one at year boundaries",
+    )
+    text = prompts.render_prompt(finding, repo="neerajsa/superset", branch="master", run_id="run-1")
+
+    assert "Find the actual root cause" in text
+    assert "regression test" in text
+    assert "Previous calendar quarter is off by one at year boundaries" in text
+
+
 def test_render_prompt_raises_for_unknown_finding_class():
     finding = Finding(
         fingerprint="f", source="s", finding_class="not-a-real-class",
