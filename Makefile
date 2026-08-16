@@ -1,8 +1,7 @@
-.PHONY: up test reset seed verify-clean tunnel
+.PHONY: up test seed verify-clean tunnel
 
 up:           ; docker compose up --build
 test:         ; python -m pytest tests/
-reset:        ; ./scripts/reset_for_demo.sh
 seed:         ; ./scripts/seed_defects.sh
 tunnel:       ; cloudflared tunnel --url http://localhost:8000
 verify-clean:
