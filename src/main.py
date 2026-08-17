@@ -110,24 +110,40 @@ async def github_webhook(request: Request) -> dict[str, str]:
     event = request.headers.get("x-github-event")
     payload = json.loads(body) if body else {}
 
-    if event == "issues" and payload.get("action") == "labeled":
+    if event == "issues" and _has_devin_autofix_trigger(payload):
         # The delivery is already recorded as seen above, so a redelivery of
         # this same event won't be retried by us even if handling fails here
         # (GitHub would just get a 200 either way). Never let a downstream
         # API hiccup turn into a crashed webhook endpoint - log and move on.
         try:
-            await _handle_issue_labeled(payload)
+            await _handle_issue_finding(payload["issue"])
         except Exception:
-            logger.exception("failed to handle issues.labeled for delivery %s", delivery_id)
+            logger.exception("failed to handle issues event for delivery %s", delivery_id)
 
     return {"status": "accepted"}
 
 
-async def _handle_issue_labeled(payload: dict) -> None:
-    if payload.get("label", {}).get("name") != "devin-autofix":
-        return
+def _has_devin_autofix_trigger(payload: dict) -> bool:
+    """True if this issues-event payload should trigger a dispatch attempt.
 
-    issue = payload["issue"]
+    Two cases, not one: the label was just added (action=labeled, the
+    payload's own `label` key names it), or the issue was opened already
+    carrying the label. GitHub does NOT fire a separate `labeled` event when
+    a label is included at issue creation - confirmed empirically against a
+    real webhook (Task 4.2) - so a human filing an issue and picking
+    devin-autofix from the labels dropdown before submitting (a completely
+    normal GitHub UI flow) would otherwise never trigger anything at all.
+    """
+    action = payload.get("action")
+    if action == "labeled":
+        return payload.get("label", {}).get("name") == "devin-autofix"
+    if action == "opened":
+        labels = [label["name"] for label in payload.get("issue", {}).get("labels", [])]
+        return "devin-autofix" in labels
+    return False
+
+
+async def _handle_issue_finding(issue: dict) -> None:
     fingerprint = extract_fingerprint(issue.get("body") or "")
 
     if fingerprint is None:
@@ -214,9 +230,8 @@ async def _scan_and_file(run_id: str) -> None:
             store.set_finding_issue(
                 _conn, finding_id, issue_number=issue["number"], issue_url=issue["html_url"],
             )
-            # Labeling separately (not at creation) guarantees a distinct
-            # issues.labeled webhook event, which is what actually triggers
-            # dispatch via the existing _handle_issue_labeled path above -
+            # Labeling separately (not at creation) triggers a real issues.labeled
+            # event, one of two paths _has_devin_autofix_trigger recognizes above -
             # this function only scans, files, and labels; it doesn't dispatch.
             await _github_client.label(issue["number"], ["devin-autofix"])
     except Exception:
