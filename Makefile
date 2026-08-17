@@ -7,7 +7,9 @@ tunnel:       ; cloudflared tunnel --url http://localhost:8000
 verify-clean:
 	rm -rf /tmp/devin-solution-verify-clean
 	git clone . /tmp/devin-solution-verify-clean
-	cd /tmp/devin-solution-verify-clean && cp .env.example .env && \
+	cp .env /tmp/devin-solution-verify-clean/.env
+	cd /tmp/devin-solution-verify-clean && \
 	  docker compose build --no-cache && \
 	  docker compose up -d && \
-	  sleep 10 && curl -f http://localhost:8000/healthz
+	  sleep 10 && \
+	  curl -f -H "Authorization: Bearer $$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)" http://localhost:8000/healthz

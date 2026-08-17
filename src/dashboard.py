@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 import metrics
+from auth import require_token
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -14,6 +15,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 @router.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
+    require_token(request, request.app.state.webhook_secret)
     conn = request.app.state.conn
     findings = conn.execute("SELECT * FROM findings ORDER BY created_at DESC").fetchall()
     return templates.TemplateResponse(

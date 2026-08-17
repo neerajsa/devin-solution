@@ -6,6 +6,7 @@ IMPLEMENTATION_PLAN.md
 docs/
 
 .venv/
+.venv311/
 __pycache__/
 .pytest_cache/
 *.pyc

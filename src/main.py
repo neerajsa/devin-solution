@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 import config
 import store
+from auth import require_token
 from dashboard import router as dashboard_router
 from devin import DevinClient
 from github_client import GitHubClient, extract_fingerprint
@@ -34,6 +35,7 @@ _orchestrator = Orchestrator(
 )
 
 app.state.conn = _conn
+app.state.webhook_secret = _cfg.webhook_secret
 app.include_router(dashboard_router)
 
 
@@ -52,22 +54,46 @@ def _finding_from_row(row) -> Finding:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+def healthz(request: Request) -> dict[str, str]:
+    # Gated once a public tunnel exists (Task 4.2) - an unauthenticated liveness
+    # probe still confirms to anyone with the URL that something real is behind
+    # it, which is worth closing off even though the response itself is inert.
+    require_token(request, _cfg.webhook_secret)
     return {"status": "ok"}
 
 
 @app.post("/scan/run")
 async def scan_run(request: Request) -> dict[str, str]:
-    # Not a GitHub-signed webhook - this is our own trigger, called by
-    # scanner/scan.yml (scheduled or workflow_dispatch) on the fork. Reuses
-    # WEBHOOK_SECRET as a bearer token rather than adding a second secret.
+    # Not a GitHub-signed webhook - a manual on-demand trigger for us, e.g. to
+    # scan right now during testing instead of waiting for the next interval
+    # of the internal scheduler below. Reuses WEBHOOK_SECRET as a bearer token
+    # rather than adding a second secret.
     auth = request.headers.get("authorization", "")
     if auth != f"Bearer {_cfg.webhook_secret}":
         raise HTTPException(status_code=401, detail="invalid token")
 
-    run_id = store.start_run(_conn, trigger="scheduled_scan")
+    run_id = store.start_run(_conn, trigger="manual_scan")
     asyncio.create_task(_scan_and_file(run_id))
     return {"status": "accepted", "run_id": run_id}
+
+
+@app.on_event("startup")
+async def _start_scan_scheduler() -> None:
+    asyncio.create_task(_scan_loop())
+
+
+async def _scan_loop() -> None:
+    # The periodic scan trigger lives here, in-process, rather than as a
+    # GitHub Actions workflow committed into the fork - nothing about a
+    # "scheduled trigger" requires it to live in the target repo's CI, and
+    # keeping it here avoids splitting scan orchestration (already entirely
+    # in this process: scanning, finding storage, dispatch) across two repos
+    # for no real benefit. Sleeps first, then scans, matching how a real cron
+    # schedule behaves - use POST /scan/run above to trigger one immediately.
+    while True:
+        await asyncio.sleep(_cfg.scan_interval_seconds)
+        run_id = store.start_run(_conn, trigger="scheduled_scan")
+        await _scan_and_file(run_id)
 
 
 @app.post("/webhooks/github")

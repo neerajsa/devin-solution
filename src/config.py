@@ -15,9 +15,14 @@ class Config:
     devin_org_id: str
     github_token: str
     github_repo: str
+    scan_interval_seconds: int
 
 
 REQUIRED = ["WEBHOOK_SECRET", "DEVIN_API_KEY", "DEVIN_ORG_ID", "GITHUB_TOKEN", "GITHUB_REPO"]
+
+# Not a credential, so not in REQUIRED - an operational tuning knob with a sane
+# default (daily) that's fine to run without ever setting explicitly.
+DEFAULT_SCAN_INTERVAL_SECONDS = 86400
 
 
 def load() -> Config:
@@ -31,4 +36,5 @@ def load() -> Config:
         devin_org_id=os.environ["DEVIN_ORG_ID"],
         github_token=os.environ["GITHUB_TOKEN"],
         github_repo=os.environ["GITHUB_REPO"],
+        scan_interval_seconds=int(os.environ.get("SCAN_INTERVAL_SECONDS") or DEFAULT_SCAN_INTERVAL_SECONDS),
     )

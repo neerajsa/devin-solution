@@ -47,3 +47,17 @@ def test_empty_string_counts_as_missing(monkeypatch):
 
     with pytest.raises(config.ConfigError, match="WEBHOOK_SECRET"):
         config.load()
+
+
+def test_scan_interval_defaults_when_unset(monkeypatch):
+    _set_all(monkeypatch)
+    monkeypatch.delenv("SCAN_INTERVAL_SECONDS", raising=False)
+
+    assert config.load().scan_interval_seconds == config.DEFAULT_SCAN_INTERVAL_SECONDS
+
+
+def test_scan_interval_is_overridable(monkeypatch):
+    _set_all(monkeypatch)
+    monkeypatch.setenv("SCAN_INTERVAL_SECONDS", "300")
+
+    assert config.load().scan_interval_seconds == 300
