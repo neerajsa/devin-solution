@@ -110,6 +110,18 @@ def test_record_delivery_dedupes(conn):
     assert store.record_delivery(conn, "delivery-2") is True
 
 
+def test_claim_finding_for_dispatch_is_exclusive(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="pysec-2026-3447:setuptools", source="pip-audit",
+        finding_class="dependency-cve", severity="unrated", summary="setuptools CVE",
+    )
+    assert store.claim_finding_for_dispatch(conn, finding_id) is True
+    assert store.claim_finding_for_dispatch(conn, finding_id) is False
+
+    row = store.get_finding(conn, finding_id)
+    assert row["status"] == "dispatching"
+
+
 def test_start_and_finish_run(conn):
     run_id = store.start_run(conn, "scheduled")
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()

@@ -170,6 +170,14 @@ async def _handle_issue_finding(issue: dict) -> None:
     store.set_finding_issue(
         _conn, finding_row["id"], issue_number=issue["number"], issue_url=issue["html_url"],
     )
+
+    if not store.claim_finding_for_dispatch(_conn, finding_row["id"]):
+        # Already claimed by another trigger event for the same finding (real,
+        # observed case: GitHub sending both issues.opened-with-label and a
+        # separate issues.labeled for one issue-creation-with-label call) -
+        # skip rather than start a second Devin session for the same work.
+        return
+
     run_id = store.start_run(_conn, trigger="issue_labeled")
     asyncio.create_task(_dispatch_and_verify(_finding_from_row(finding_row), run_id))
 

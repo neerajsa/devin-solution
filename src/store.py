@@ -111,6 +111,21 @@ def update_finding_status(conn: sqlite3.Connection, finding_id: str, status: str
     conn.commit()
 
 
+def claim_finding_for_dispatch(conn: sqlite3.Connection, finding_id: str) -> bool:
+    """Atomically transition a finding from 'new' to 'dispatching'. Returns True only
+    for the caller that actually performed the transition - False means someone else
+    already claimed it. Guards against two different GitHub events (e.g. issues.opened
+    with a label already present, and a separate issues.labeled for the same action -
+    both real, both observed for a single `gh issue create --label` call) each
+    independently deciding to start a Devin session for the same finding."""
+    cur = conn.execute(
+        "UPDATE findings SET status = 'dispatching', updated_at = ? WHERE id = ? AND status = 'new'",
+        (time.time(), finding_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def set_finding_issue(conn: sqlite3.Connection, finding_id: str, *,
                        issue_number: int, issue_url: str) -> None:
     conn.execute(
