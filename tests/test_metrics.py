@@ -27,8 +27,8 @@ def _add_session(conn, *, state: str, human_messages_sent: int = 0, ci_retries: 
 
 
 def test_autonomy_rate_only_counts_successful_states_with_zero_human_messages(conn):
-    _add_session(conn, state="remediated_ci_green", human_messages_sent=0)
-    _add_session(conn, state="remediated_ci_green", human_messages_sent=1)  # needed a nudge
+    _add_session(conn, state="remediated", human_messages_sent=0)
+    _add_session(conn, state="remediated", human_messages_sent=1)  # needed a nudge
     _add_session(conn, state="needs_human", human_messages_sent=0)  # not a successful state at all
 
     assert metrics.autonomy_rate(conn) == 0.5  # 1 of 2 successful states was fully autonomous
@@ -39,14 +39,21 @@ def test_autonomy_rate_is_none_with_no_successful_sessions(conn):
     assert metrics.autonomy_rate(conn) is None
 
 
-def test_first_pass_ci_rate_requires_zero_retries_and_green(conn):
-    _add_session(conn, state="remediated_ci_green", ci_retries=0)
-    _add_session(conn, state="remediated_ci_green", ci_retries=1)  # green, but not on the first try
-    _add_session(conn, state="ci_red_needs_human", ci_retries=1)
-
-    assert metrics.first_pass_ci_rate(conn) == pytest.approx(1 / 3)
-
-
-def test_first_pass_ci_rate_ignores_sessions_never_ci_verified(conn):
-    _add_session(conn, state="needs_human")  # never reached CI verification at all
+def test_first_pass_ci_rate_always_none_now_ci_verification_is_retired(conn):
+    # [REVISED 2026-08-17] CI verification (and the states that fed this metric)
+    # was retired the same day it was built - see orchestrator.py's module
+    # docstring. Regardless of what's in the sessions table, there's nothing
+    # left for this metric to compute - flagged as an open question for a
+    # human, not silently deleted.
+    _add_session(conn, state="remediated", ci_retries=0)
     assert metrics.first_pass_ci_rate(conn) is None
+
+
+def test_cost_per_merged_fix_counts_pr_backed_states_only(conn):
+    _add_session(conn, state="remediated")
+    _add_session(conn, state="partially_remediated")
+    _add_session(conn, state="not_applicable")  # no PR - not a "merged fix"
+    _add_session(conn, state="needs_human")  # no PR either
+
+    result = metrics.cost_per_merged_fix(conn)
+    assert result["merged_fix_count"] == 2

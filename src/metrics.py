@@ -3,9 +3,15 @@ CI conclusions/our own timestamps - never parsed from prose. See IMPLEMENTATION_
 
 import statistics
 
-SUCCESSFUL_STATES = {"remediated", "remediated_ci_green", "partially_remediated", "not_applicable"}
-CI_VERIFIED_STATES = {"remediated_ci_green", "ci_red_needs_human"}
-FAILURE_STATES = ["blocked", "no_pr", "needs_human", "ci_red_needs_human"]
+# [REVISED 2026-08-17] A real PR is the completion signal now, not a CI-verified
+# green (orchestrator.py no longer produces remediated_ci_green/ci_red_needs_human/
+# ci_unverifiable at all - CI verification was built, then retired the same day
+# after a real incident). PR_BACKED_STATES replaces what remediated_ci_green meant
+# for "merged fix" purposes below.
+SUCCESSFUL_STATES = {"remediated", "partially_remediated", "not_applicable"}
+PR_BACKED_STATES = {"remediated", "partially_remediated"}
+CI_VERIFIED_STATES: set[str] = set()  # kept as a named constant; see first_pass_ci_rate's docstring
+FAILURE_STATES = ["blocked", "no_pr", "needs_human"]
 
 
 def backlog_burndown(conn) -> dict:
@@ -34,17 +40,15 @@ def autonomy_rate(conn) -> float | None:
 
 
 def first_pass_ci_rate(conn) -> float | None:
-    """% of Devin PRs green on the first CI run - the quality metric, not just throughput."""
-    rows = conn.execute(
-        "SELECT state, ci_retries FROM sessions WHERE state IN ({})".format(
-            ",".join("?" * len(CI_VERIFIED_STATES))
-        ),
-        list(CI_VERIFIED_STATES),
-    ).fetchall()
-    if not rows:
-        return None
-    first_pass = sum(1 for r in rows if r["state"] == "remediated_ci_green" and r["ci_retries"] == 0)
-    return first_pass / len(rows)
+    """[REVISED 2026-08-17] Always returns None - CI verification was retired the same
+    day it was built (see orchestrator.py's module docstring for the real incident that
+    drove this), so there are no CI-verified states left for this metric to measure.
+    Kept as a function (not deleted outright) since first-pass CI rate was named as a
+    specific deliverable in IMPLEMENTATION_PLAN.md #1.3 - this is a flagged, open
+    question for a human to resolve (relabel the dashboard card, replace it with a
+    review-triggered-rate metric, or formally drop it to a five-metric dashboard),
+    not a silent removal."""
+    return None
 
 
 def latency_percentiles(conn) -> dict:
@@ -70,17 +74,24 @@ def latency_percentiles(conn) -> dict:
 
 
 def cost_per_merged_fix(conn) -> dict:
-    """Total ACUs consumed / count of CI-green merges. Reported in ACU units, not dollars -
-    current ACU-to-USD pricing was never authoritatively confirmed (see docs/api-surface.md),
-    so this doesn't fabricate a conversion."""
+    """Total ACUs consumed / count of PR-backed fixes (remediated/partially_remediated -
+    the same PR-is-the-completion-signal definition dispatch() now uses, [REVISED
+    2026-08-17], replacing what remediated_ci_green meant here before CI verification
+    was retired). Reported in ACU units, not dollars: acus_consumed is confirmed
+    non-functional for self-serve accounts (always 0 - see IMPLEMENTATION_PLAN.md),
+    so this number is honestly near-meaningless right now, not just unconverted -
+    flagged as an open problem, not fabricated around."""
     total_acu = conn.execute("SELECT COALESCE(SUM(acu_used), 0) as total FROM sessions").fetchone()["total"]
-    green_count = conn.execute(
-        "SELECT COUNT(*) as n FROM sessions WHERE state = 'remediated_ci_green'"
+    merged_count = conn.execute(
+        "SELECT COUNT(*) as n FROM sessions WHERE state IN ({})".format(
+            ",".join("?" * len(PR_BACKED_STATES))
+        ),
+        list(PR_BACKED_STATES),
     ).fetchone()["n"]
     return {
         "total_acu": total_acu,
-        "remediated_ci_green_count": green_count,
-        "acu_per_merged_fix": (total_acu / green_count) if green_count else None,
+        "merged_fix_count": merged_count,
+        "acu_per_merged_fix": (total_acu / merged_count) if merged_count else None,
     }
 
 

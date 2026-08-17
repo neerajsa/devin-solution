@@ -30,9 +30,7 @@ os.makedirs("data", exist_ok=True)
 _conn = store.connect("data/pipeline.db")
 _devin_client = DevinClient(api_key=_cfg.devin_api_key, org_id=_cfg.devin_org_id)
 _github_client = GitHubClient(token=_cfg.github_token, repo=_cfg.github_repo)
-_orchestrator = Orchestrator(
-    devin_client=_devin_client, github_client=_github_client, conn=_conn, repo=_cfg.github_repo,
-)
+_orchestrator = Orchestrator(devin_client=_devin_client, conn=_conn, repo=_cfg.github_repo)
 
 app.state.conn = _conn
 app.state.webhook_secret = _cfg.webhook_secret
@@ -179,28 +177,27 @@ async def _handle_issue_finding(issue: dict) -> None:
         return
 
     run_id = store.start_run(_conn, trigger="issue_labeled")
-    asyncio.create_task(_dispatch_and_verify(_finding_from_row(finding_row), run_id))
+    asyncio.create_task(_dispatch(_finding_from_row(finding_row), run_id))
 
 
-async def _dispatch_and_verify(finding: Finding, run_id: str) -> None:
+async def _dispatch(finding: Finding, run_id: str) -> None:
     # This runs as a fire-and-forget background task (asyncio.create_task) so
     # the webhook response isn't blocked on a multi-minute Devin session. A
     # failure anywhere in here would otherwise only surface via asyncio's
     # default unhandled-task-exception logging and never touch the runs
     # table, so any failure must be caught and persisted explicitly - not
     # swallowed, per the same rule devin.py follows for its own errors.
+    #
+    # dispatch() itself now runs to a real terminal outcome (a real PR is the
+    # completion signal - see orchestrator.py's 2026-08-17 revision) and
+    # already terminates the session and triggers a Devin Review before
+    # returning, so there's nothing further to do here after it returns.
     sessions_count = 0
     try:
-        result = await _orchestrator.dispatch(finding, run_id=run_id)
+        await _orchestrator.dispatch(finding, run_id=run_id)
         sessions_count = 1
-        if result["state"] in ("remediated", "partially_remediated") and result["pr_url"]:
-            await _orchestrator.verify_ci(
-                session_id=result["session_id"],
-                devin_session_id=result["devin_session_id"],
-                pr_url=result["pr_url"],
-            )
     except Exception:
-        logger.exception("dispatch/verify failed for run %s", run_id)
+        logger.exception("dispatch failed for run %s", run_id)
     finally:
         store.finish_run(_conn, run_id, findings_count=1, sessions_count=sessions_count)
 

@@ -41,6 +41,15 @@ class DevinClient:
             json={"message": message},
         )
 
+    async def trigger_pr_review(self, pr_url: str) -> dict:
+        """POST .../pr-reviews - a separate, standalone action against a PR URL, not tied
+        to any coding session_id. Fire-and-forget from the orchestrator's perspective:
+        callers don't poll this to completion, so a reviewer just reads the findings
+        Devin Review posts directly to the PR on GitHub."""
+        return await self._request(
+            "POST", f"/v3/organizations/{self._org_id}/pr-reviews", json={"pr_url": pr_url},
+        )
+
     async def terminate_session(self, session_id: str, *, archive: bool = True) -> dict:
         """DELETE ...?archive=true both stops the session and preserves it for our audit trail.
 

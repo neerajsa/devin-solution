@@ -72,6 +72,7 @@ class FakeDevinClient:
         self.created = None
         self.messages_sent: list[str] = []
         self.terminated: list[tuple[str, bool]] = []
+        self.reviews_triggered: list[str] = []
 
     async def create_session(self, **kwargs):
         self.created = kwargs
@@ -86,21 +87,8 @@ class FakeDevinClient:
     async def terminate_session(self, session_id, *, archive=True):
         self.terminated.append((session_id, archive))
 
-
-class FakeGitHubClient:
-    """Scripted fake - github_client.py's own HTTP behavior is tested separately."""
-
-    def __init__(self, *, checks_conclusion: str = "success", failing_log: str = "AssertionError"):
-        self.checks_conclusion = checks_conclusion
-        self.failing_log = failing_log
-        self.wait_for_checks_calls: list[int] = []
-
-    async def wait_for_checks(self, pr_number, *, timeout=900):
-        self.wait_for_checks_calls.append(pr_number)
-        return self.checks_conclusion
-
-    async def failing_job_log(self, pr_number):
-        return self.failing_log
+    async def trigger_pr_review(self, pr_url):
+        self.reviews_triggered.append(pr_url)
 
 
 @pytest.fixture
@@ -120,42 +108,43 @@ def _cve_finding(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_working_then_remediated_leaves_session_open_for_ci_loop(conn):
+async def test_dispatch_remediated_with_pr_terminates_and_triggers_review(conn):
+    # [REVISED 2026-08-17] A real PR is the completion signal, full stop - no more
+    # waiting on CI. The session terminates as soon as the PR exists, and Devin
+    # Review is triggered on it (fire-and-forget, not awaited to completion).
     fake = FakeDevinClient([
         {"status": "running", "status_detail": "working"},
         {"status": "running", "status_detail": "working",
          "structured_output": {"status": "remediated"},
          "pull_requests": [{"pr_url": "https://github.com/x/y/pull/1"}]},
     ])
-    orch = orchestrator.Orchestrator(
-        devin_client=fake, github_client=FakeGitHubClient(), conn=conn, repo="x/y", poll_interval=0,
-    )
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     result = await orch.dispatch(_cve_finding(), run_id="run-1")
 
     assert result["state"] == "remediated"
     assert result["pr_url"] == "https://github.com/x/y/pull/1"
-    assert fake.terminated == []  # not terminated - CI loop still needs it
+    assert fake.terminated == [("devin-1", True)]
+    assert fake.reviews_triggered == ["https://github.com/x/y/pull/1"]
 
     row = store.get_session(conn, result["session_id"])
     assert row["state"] == "remediated"
-    assert row["terminal_at"] is None
+    assert row["terminal_at"] is not None
 
 
 @pytest.mark.asyncio
-async def test_dispatch_needs_human_terminates_session_immediately(conn):
+async def test_dispatch_needs_human_terminates_session_and_skips_review(conn):
     fake = FakeDevinClient([
         {"status": "running", "status_detail": "working",
          "structured_output": {"status": "needs_human"}, "pull_requests": []},
     ])
-    orch = orchestrator.Orchestrator(
-        devin_client=fake, github_client=FakeGitHubClient(), conn=conn, repo="x/y", poll_interval=0,
-    )
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     result = await orch.dispatch(_cve_finding(), run_id="run-1")
 
     assert result["state"] == "needs_human"
     assert fake.terminated == [("devin-1", True)]
+    assert fake.reviews_triggered == []  # no PR, nothing to review
 
     row = store.get_session(conn, result["session_id"])
     assert row["terminal_at"] is not None
@@ -165,8 +154,7 @@ async def test_dispatch_needs_human_terminates_session_immediately(conn):
 async def test_dispatch_blocked_nudges_once_then_times_out_to_needs_human(conn):
     fake = FakeDevinClient([{"status": "running", "status_detail": "waiting_for_user"}])
     orch = orchestrator.Orchestrator(
-        devin_client=fake, github_client=FakeGitHubClient(), conn=conn, repo="x/y",
-        poll_interval=0, blocked_nudge_timeout=0,
+        devin_client=fake, conn=conn, repo="x/y", poll_interval=0, blocked_nudge_timeout=0,
     )
 
     result = await orch.dispatch(_cve_finding(), run_id="run-1")
@@ -182,9 +170,7 @@ async def test_dispatch_records_finding_and_records_evidence_based_history(conn)
         {"status": "running", "status_detail": "working",
          "structured_output": {"status": "not_applicable"}, "pull_requests": []},
     ])
-    orch = orchestrator.Orchestrator(
-        devin_client=fake, github_client=FakeGitHubClient(), conn=conn, repo="x/y", poll_interval=0,
-    )
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     finding = _cve_finding()
     await orch.dispatch(finding, run_id="run-1")
@@ -195,87 +181,22 @@ async def test_dispatch_records_finding_and_records_evidence_based_history(conn)
     assert fake.created["tags"] == [f"finding:{finding.fingerprint}", "run:run-1", "superset"]
 
 
-# --- Orchestrator.verify_ci ---
-
-def _open_session(conn, *, pr_url="https://github.com/x/y/pull/7"):
-    """Set up a session already in the remediated-with-PR state, as dispatch() would leave it."""
-    finding_id = store.insert_finding(
-        conn, fingerprint="f-ci", source="pip-audit", finding_class="dependency-cve",
-        severity="unrated", summary="s",
-    )
-    session_id = store.upsert_session(
-        conn, session_id=None, finding_id=finding_id,
-        devin_session_id="devin-1", devin_url="https://app.devin.ai/sessions/devin-1",
-        state="remediated", pr_url=pr_url,
-    )
-    return session_id, pr_url
-
-
 @pytest.mark.asyncio
-async def test_verify_ci_green_terminates_session(conn):
-    session_id, pr_url = _open_session(conn)
-    fake_devin = FakeDevinClient([{}])
-    fake_github = FakeGitHubClient(checks_conclusion="success")
-    orch = orchestrator.Orchestrator(devin_client=fake_devin, github_client=fake_github, conn=conn, repo="x/y")
+async def test_dispatch_review_trigger_failure_does_not_affect_result(conn):
+    # A broken review-trigger call must never take down an already-correct,
+    # already-recorded dispatch outcome - it's a nice-to-have, not a gate.
+    class FailingReviewDevinClient(FakeDevinClient):
+        async def trigger_pr_review(self, pr_url):
+            raise RuntimeError("boom")
 
-    result = await orch.verify_ci(session_id=session_id, devin_session_id="devin-1", pr_url=pr_url)
+    fake = FailingReviewDevinClient([
+        {"status": "running", "status_detail": "working",
+         "structured_output": {"status": "remediated"},
+         "pull_requests": [{"pr_url": "https://github.com/x/y/pull/1"}]},
+    ])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
-    assert result["state"] == "remediated_ci_green"
-    assert fake_devin.terminated == [("devin-1", True)]
-    assert fake_github.wait_for_checks_calls == [7]
+    result = await orch.dispatch(_cve_finding(), run_id="run-1")
 
-    row = store.get_session(conn, session_id)
-    assert row["ci_conclusion"] == "success"
-    assert row["terminal_at"] is not None
-
-
-@pytest.mark.asyncio
-async def test_verify_ci_red_first_time_sends_log_and_stays_open(conn):
-    session_id, pr_url = _open_session(conn)
-    fake_devin = FakeDevinClient([{}])
-    fake_github = FakeGitHubClient(checks_conclusion="failure", failing_log="boom: test_x failed")
-    orch = orchestrator.Orchestrator(devin_client=fake_devin, github_client=fake_github, conn=conn, repo="x/y")
-
-    result = await orch.verify_ci(session_id=session_id, devin_session_id="devin-1", pr_url=pr_url)
-
-    assert result["state"] == "ci_retry_dispatched"
-    assert fake_devin.terminated == []  # not terminated - still has a retry available
-    assert len(fake_devin.messages_sent) == 1
-    assert "boom: test_x failed" in fake_devin.messages_sent[0]
-    assert "do not open a new pr" in fake_devin.messages_sent[0].lower()
-
-    row = store.get_session(conn, session_id)
-    assert row["ci_retries"] == 1
-
-
-@pytest.mark.asyncio
-async def test_verify_ci_red_second_time_escalates_and_terminates(conn):
-    session_id, pr_url = _open_session(conn)
-    # Simulate this session already having used its one retry.
-    store.upsert_session(conn, session_id=session_id, state="remediated", pr_url=pr_url, ci_retries=1)
-
-    fake_devin = FakeDevinClient([{}])
-    fake_github = FakeGitHubClient(checks_conclusion="failure")
-    orch = orchestrator.Orchestrator(devin_client=fake_devin, github_client=fake_github, conn=conn, repo="x/y")
-
-    result = await orch.verify_ci(session_id=session_id, devin_session_id="devin-1", pr_url=pr_url)
-
-    assert result["state"] == "ci_red_needs_human"
-    assert fake_devin.terminated == [("devin-1", True)]
-    assert fake_devin.messages_sent == []  # no more retries - straight to escalation, no new message
-
-
-@pytest.mark.asyncio
-async def test_verify_ci_timeout_counts_as_failure_not_success(conn):
-    session_id, pr_url = _open_session(conn)
-    fake_devin = FakeDevinClient([{}])
-    fake_github = FakeGitHubClient(checks_conclusion="timeout")
-    orch = orchestrator.Orchestrator(devin_client=fake_devin, github_client=fake_github, conn=conn, repo="x/y")
-
-    result = await orch.verify_ci(session_id=session_id, devin_session_id="devin-1", pr_url=pr_url)
-
-    assert result["state"] == "ci_retry_dispatched"  # treated like a failure, gets the one retry
-
-
-def test_pr_number_from_url_parses_trailing_digits():
-    assert orchestrator.pr_number_from_url("https://github.com/neerajsa/superset/pull/42") == 42
+    assert result["state"] == "remediated"
+    assert fake.terminated == [("devin-1", True)]

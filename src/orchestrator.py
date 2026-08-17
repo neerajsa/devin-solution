@@ -5,26 +5,31 @@ never reaches a terminal value (confirmed empirically - see
 docs/api-surface.md), so `resolve()` treats a real pull_requests[]
 entry or a well-formed terminal structured_output claim as the signal,
 not `status` alone.
+
+[REVISED 2026-08-17] Completion is judged on a real PR existing, full stop -
+CI verification (waiting for the PR's checks to go green, retrying a failure
+back into the same session) was built, tested, and then retired the same day
+after a real incident: GitHub Actions was never enabled on the target fork,
+`wait_for_checks` timed out, and the retry logic sent Devin a "CI failed"
+message with no actual evidence behind it - Devin was told to fix something
+that was never broken. Waiting on third-party CI to resolve (which turned out
+to plausibly need 30-40+ minutes on this specific workflow, not the ~15
+originally assumed) also meant sessions could sit open far longer than makes
+sense for this MVP. A human reviewing the PR is the actual gate before
+anything merges regardless, so verifying CI ourselves isn't load-bearing for
+that decision - see IMPLEMENTATION_PLAN.md for the full writeup.
 """
 
 import asyncio
+import logging
 import time
 
 import prompts
 import store
 from devin import DevinClient
-from github_client import GitHubClient
 from scanners import Finding
 
-CI_RETRY_MESSAGE_TEMPLATE = (
-    "CI failed on your PR. Below is the failing job log. Diagnose the "
-    "failure and push a fix to the same branch. Do not open a new PR.\n\n{log}"
-)
-CI_LOG_TRUNCATE_CHARS = 6000
-
-
-def pr_number_from_url(pr_url: str) -> int:
-    return int(pr_url.rstrip("/").rsplit("/", 1)[-1])
+logger = logging.getLogger("orchestrator")
 
 TERMINAL_SESSION_STATUS = {"exit", "error"}
 BLOCKED_DETAILS = {"waiting_for_user", "waiting_for_approval"}
@@ -60,29 +65,26 @@ def resolve(session: dict) -> tuple[str, str | None]:
 
 
 class Orchestrator:
-    def __init__(self, *, devin_client: DevinClient, github_client: GitHubClient, conn,
-                 repo: str, branch: str = "master",
+    def __init__(self, *, devin_client: DevinClient, conn, repo: str, branch: str = "master",
                  max_concurrent: int = 4, max_acu_limit: int = 20,
-                 poll_interval: float = 15, blocked_nudge_timeout: float = 300,
-                 ci_timeout: float = 900):
+                 poll_interval: float = 15, blocked_nudge_timeout: float = 300):
         self._devin = devin_client
-        self._github = github_client
         self._conn = conn
         self._repo = repo
         self._branch = branch
         self._max_acu_limit = max_acu_limit
         self._poll_interval = poll_interval
         self._blocked_nudge_timeout = blocked_nudge_timeout
-        self._ci_timeout = ci_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def dispatch(self, finding: Finding, *, run_id: str) -> dict:
         """Create/reuse the finding record, dispatch a Devin session, poll to a terminal outcome.
 
-        Terminates the session immediately for outcomes that don't need it
-        kept alive (not_applicable, needs_human, no_pr). Leaves it open for
-        remediated/partially_remediated with a real PR - the CI verification
-        loop needs it for a possible same-session retry.
+        A real PR is the completion signal - the session terminates as soon as
+        one exists, for every outcome. A human approving the PR is the actual
+        gate before anything merges, and Devin Review (triggered below,
+        fire-and-forget) gives them an automated second opinion to read
+        alongside it - we don't block termination on either.
         """
         finding_id = store.insert_finding(
             self._conn, fingerprint=finding.fingerprint, source=finding.source,
@@ -106,7 +108,18 @@ class Orchestrator:
                 self._conn, session_id=None, finding_id=finding_id,
                 devin_session_id=devin_session_id, devin_url=raw["url"], state="working",
             )
-            return await self._poll_to_terminal(session_id, devin_session_id)
+            result = await self._poll_to_terminal(session_id, devin_session_id)
+
+            if result.get("pr_url"):
+                try:
+                    await self._devin.trigger_pr_review(result["pr_url"])
+                except Exception:
+                    # Never let a review-trigger failure affect the dispatch outcome
+                    # that's already been recorded - it's a nice-to-have on top of a
+                    # real, already-terminated result, not a gate on anything.
+                    logger.exception("failed to trigger PR review for %s", result["pr_url"])
+
+            return result
 
     async def _poll_to_terminal(self, session_id: str, devin_session_id: str) -> dict:
         nudged_at: float | None = None
@@ -138,74 +151,23 @@ class Orchestrator:
                 await asyncio.sleep(self._poll_interval)
                 continue
 
-            # Terminal from our perspective: not_applicable, needs_human, no_pr,
-            # or a PR-backed remediated/partially_remediated claim.
-            terminal = state not in PR_BACKED_CLAIMS
-            result = await self._finish(
+            # Terminal from our perspective, always: not_applicable, needs_human,
+            # no_pr, or a PR-backed remediated/partially_remediated claim. A real
+            # PR is the completion signal now - the session always terminates here.
+            return await self._finish(
                 session_id, devin_session_id, state=state, pr_url=pr_url,
                 structured_output=raw.get("structured_output"),
-                human_messages_sent=human_messages_sent, terminate_session=terminal,
+                human_messages_sent=human_messages_sent,
                 acu_used=raw.get("acus_consumed") or 0,
             )
-            return result
-
-    async def verify_ci(self, *, session_id: str, devin_session_id: str, pr_url: str) -> dict:
-        """"PR opened" is not success; "PR green" is. One retry, same session, then escalate.
-
-        Same session so Devin keeps its context; one retry only so a broken
-        fix can't loop; truncated log to control prompt size; explicit
-        "do not open a new PR" because otherwise the natural agent behavior
-        is to branch again.
-        """
-        pr_number = pr_number_from_url(pr_url)
-        conclusion = await self._github.wait_for_checks(pr_number, timeout=self._ci_timeout)
-        row = store.get_session(self._conn, session_id)
-        ci_retries = row["ci_retries"]
-        # Refresh acus_consumed at each CI-verification step so "cost per merged
-        # fix" reflects the full session cost, not just what it was at dispatch time.
-        acu_used = (await self._devin.get_session(devin_session_id)).get("acus_consumed") or 0
-
-        if conclusion == "success":
-            return await self._finish_ci(
-                session_id, devin_session_id, state="remediated_ci_green",
-                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries, acu_used=acu_used,
-            )
-
-        if ci_retries >= 1:
-            return await self._finish_ci(
-                session_id, devin_session_id, state="ci_red_needs_human",
-                pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries, acu_used=acu_used,
-            )
-
-        log = await self._github.failing_job_log(pr_number)
-        await self._devin.send_message(
-            devin_session_id, CI_RETRY_MESSAGE_TEMPLATE.format(log=log[:CI_LOG_TRUNCATE_CHARS]),
-        )
-        store.upsert_session(
-            self._conn, session_id=session_id, state="ci_retry_dispatched",
-            pr_url=pr_url, ci_conclusion=conclusion, ci_retries=ci_retries + 1,
-            acu_used=acu_used, terminal=False,
-        )
-        return {"session_id": session_id, "devin_session_id": devin_session_id, "state": "ci_retry_dispatched", "pr_url": pr_url}
-
-    async def _finish_ci(self, session_id: str, devin_session_id: str, *, state: str,
-                          pr_url: str, ci_conclusion: str, ci_retries: int, acu_used: float) -> dict:
-        store.upsert_session(
-            self._conn, session_id=session_id, state=state, pr_url=pr_url,
-            ci_conclusion=ci_conclusion, ci_retries=ci_retries, acu_used=acu_used, terminal=True,
-        )
-        await self._devin.terminate_session(devin_session_id, archive=True)
-        return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}
 
     async def _finish(self, session_id: str, devin_session_id: str, *, state: str,
                        pr_url: str | None, structured_output: dict | None,
-                       human_messages_sent: int, acu_used: float = 0,
-                       terminate_session: bool = True) -> dict:
+                       human_messages_sent: int, acu_used: float = 0) -> dict:
         store.upsert_session(
             self._conn, session_id=session_id, state=state, pr_url=pr_url,
             human_messages_sent=human_messages_sent, structured_output=structured_output,
-            acu_used=acu_used, terminal=terminate_session,
+            acu_used=acu_used, terminal=True,
         )
-        if terminate_session:
-            await self._devin.terminate_session(devin_session_id, archive=True)
+        await self._devin.terminate_session(devin_session_id, archive=True)
         return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}
