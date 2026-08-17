@@ -31,6 +31,15 @@ from scanners import Finding
 
 logger = logging.getLogger("orchestrator")
 
+
+class DispatchNotStartedError(Exception):
+    """dispatch() failed before a real Devin session was created - no orphaned session
+    exists, so it's safe for a caller to retry (e.g. by resetting a finding's status
+    back to 'new'). Any OTHER exception from dispatch() means a session may already be
+    running, and must never be blindly retried - that risks a genuine duplicate session,
+    the exact real incident (2026-08-17) that motivated this distinction."""
+
+
 TERMINAL_SESSION_STATUS = {"exit", "error"}
 BLOCKED_DETAILS = {"waiting_for_user", "waiting_for_approval"}
 PR_BACKED_CLAIMS = {"remediated", "partially_remediated"}
@@ -95,14 +104,19 @@ class Orchestrator:
         )
 
         async with self._semaphore:
-            prompt = prompts.render_prompt(finding, repo=self._repo, branch=self._branch, run_id=run_id)
-            raw = await self._devin.create_session(
-                prompt=prompt,
-                title=f"{finding.finding_class}: {finding.summary[:60]}",
-                tags=[f"finding:{finding.fingerprint}", f"run:{run_id}", "superset"],
-                max_acu_limit=self._max_acu_limit,
-                structured_output_schema=prompts.STRUCTURED_OUTPUT_SCHEMA,
-            )
+            try:
+                prompt = prompts.render_prompt(finding, repo=self._repo, branch=self._branch, run_id=run_id)
+                raw = await self._devin.create_session(
+                    prompt=prompt,
+                    title=f"{finding.finding_class}: {finding.summary[:60]}",
+                    tags=[f"finding:{finding.fingerprint}", f"run:{run_id}", "superset"],
+                    max_acu_limit=self._max_acu_limit,
+                    structured_output_schema=prompts.STRUCTURED_OUTPUT_SCHEMA,
+                )
+            except Exception as e:
+                # Nothing was created yet - safe for the caller to retry.
+                raise DispatchNotStartedError(str(e)) from e
+
             devin_session_id = raw["session_id"]
             session_id = store.upsert_session(
                 self._conn, session_id=None, finding_id=finding_id,

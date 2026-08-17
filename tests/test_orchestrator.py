@@ -200,3 +200,46 @@ async def test_dispatch_review_trigger_failure_does_not_affect_result(conn):
 
     assert result["state"] == "remediated"
     assert fake.terminated == [("devin-1", True)]
+
+
+# --- Orchestrator.dispatch - the DispatchNotStartedError safety boundary ---
+#
+# Real incident (2026-08-17): a caller needs to know whether it's safe to retry a
+# failed dispatch. It's only safe if no real Devin session was ever created -
+# retrying after one was would risk a genuine duplicate session. These tests pin
+# down the exact boundary: failures at/before create_session raise
+# DispatchNotStartedError; anything after it does not.
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_before_session_created_raises_not_started_error(conn):
+    class FailsToCreateDevinClient(FakeDevinClient):
+        async def create_session(self, **kwargs):
+            raise RuntimeError("network blip talking to Devin")
+
+    fake = FailsToCreateDevinClient([{}])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    with pytest.raises(orchestrator.DispatchNotStartedError):
+        await orch.dispatch(_cve_finding(), run_id="run-1")
+
+    # No session row should exist - nothing was ever created to record.
+    assert fake.terminated == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_after_session_created_does_not_raise_not_started_error(conn):
+    class FailsMidPollDevinClient(FakeDevinClient):
+        async def get_session(self, session_id):
+            raise RuntimeError("network blip mid-poll")
+
+    fake = FailsMidPollDevinClient([{}])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await orch.dispatch(_cve_finding(), run_id="run-1")
+
+    # A real session was already created before the failure - must NOT be
+    # classified as safe-to-retry, and the original error must propagate as-is
+    # so a caller can't mistake this for the pre-session case above.
+    assert not isinstance(exc_info.value, orchestrator.DispatchNotStartedError)
+    assert fake.created is not None  # create_session did succeed before the failure

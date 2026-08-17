@@ -16,7 +16,7 @@ from auth import require_token
 from dashboard import router as dashboard_router
 from devin import DevinClient
 from github_client import GitHubClient, extract_fingerprint
-from orchestrator import Orchestrator
+from orchestrator import DispatchNotStartedError, Orchestrator
 from scanners import Finding, fetch_and_scan
 
 SCAN_TARGETS = ["requirements/base.txt", "requirements/development.txt"]
@@ -196,17 +196,26 @@ async def _dispatch(finding: Finding, run_id: str) -> None:
     try:
         await _orchestrator.dispatch(finding, run_id=run_id)
         sessions_count = 1
+    except DispatchNotStartedError:
+        # No session was ever created - safe to make this retryable (e.g. a
+        # human re-labeling the issue) rather than leaving it stuck forever.
+        logger.exception("dispatch never started for run %s - reverting for retry", run_id)
+        row = store.get_finding_by_fingerprint(_conn, finding.fingerprint)
+        if row:
+            store.update_finding_status(_conn, row["id"], "new")
     except Exception:
+        # A session may already exist - do NOT revert the claim here, that
+        # risks a genuine duplicate session (the real 2026-08-17 incident).
         logger.exception("dispatch failed for run %s", run_id)
     finally:
         store.finish_run(_conn, run_id, findings_count=1, sessions_count=sessions_count)
 
 
 async def _scan_and_file(run_id: str) -> None:
-    # Fire-and-forget background task, same failure-handling shape as
-    # _dispatch_and_verify: any error must still leave the run marked
-    # finished, never NULL forever.
+    # Fire-and-forget background task, same failure-handling shape as _dispatch:
+    # any error must still leave the run marked finished, never NULL forever.
     findings_count = 0
+    sessions_count = 0
     try:
         async with httpx.AsyncClient() as client:
             findings = await fetch_and_scan(
@@ -215,31 +224,77 @@ async def _scan_and_file(run_id: str) -> None:
         findings_count = len(findings)
 
         for finding in findings:
-            finding_id = store.insert_finding(
-                _conn, fingerprint=finding.fingerprint, source=finding.source,
-                finding_class=finding.finding_class, severity=finding.severity,
-                summary=finding.summary, package=finding.package,
-                current_version=finding.current_version, fixed_version=finding.fixed_version,
-                cve_id=finding.cve_id, file_path=finding.file_path,
-            )
-            row = store.get_finding(_conn, finding_id)
-            if row["issue_number"] is not None:
-                continue  # already filed on an earlier scan - dedup, don't re-file
-
-            issue = await _github_client.file_issue(
-                title=f"[security] {finding.package}: {finding.cve_id or finding.fingerprint}",
-                body=finding.summary,
-                fingerprint=finding.fingerprint,
-                labels=[],
-            )
-            store.set_finding_issue(
-                _conn, finding_id, issue_number=issue["number"], issue_url=issue["html_url"],
-            )
-            # Labeling separately (not at creation) triggers a real issues.labeled
-            # event, one of two paths _has_devin_autofix_trigger recognizes above -
-            # this function only scans, files, and labels; it doesn't dispatch.
-            await _github_client.label(issue["number"], ["devin-autofix"])
+            # Each finding is fault-isolated - one bad finding (a file_issue
+            # network blip, a bug in one finding's dispatch) must never abort
+            # the rest of the scan's findings.
+            try:
+                if await _file_and_dispatch(finding, run_id):
+                    sessions_count += 1
+            except Exception:
+                logger.exception("failed to process scanner finding %s", finding.fingerprint)
     except Exception:
         logger.exception("scan run %s failed", run_id)
     finally:
-        store.finish_run(_conn, run_id, findings_count=findings_count, sessions_count=0)
+        store.finish_run(_conn, run_id, findings_count=findings_count, sessions_count=sessions_count)
+
+
+async def _file_and_dispatch(finding: Finding, run_id: str) -> bool:
+    """File a GitHub issue for `finding` if it doesn't have one yet, then dispatch
+    it directly, in-process - no webhook round-trip for this trigger at all, and no
+    dependency on the tunnel being up.
+
+    Deliberately files WITHOUT the devin-autofix label. That label is reserved
+    exclusively for the webhook-triggered path (_has_devin_autofix_trigger above).
+    Including it here would make issue creation itself ALSO fire a real
+    issues.opened-with-label-present webhook event, racing this direct call for
+    the exact same finding on every single scan, not just occasionally - the
+    label is exactly what the webhook trigger watches for, so it can't be present
+    on a scanner-filed issue without creating that race by construction.
+
+    Returns True if a dispatch was actually attempted (used for the run's
+    sessions_count bookkeeping).
+    """
+    finding_id = store.insert_finding(
+        _conn, fingerprint=finding.fingerprint, source=finding.source,
+        finding_class=finding.finding_class, severity=finding.severity,
+        summary=finding.summary, package=finding.package,
+        current_version=finding.current_version, fixed_version=finding.fixed_version,
+        cve_id=finding.cve_id, file_path=finding.file_path,
+    )
+    row = store.get_finding(_conn, finding_id)
+
+    if row["issue_number"] is None:
+        issue = await _github_client.file_issue(
+            title=f"[security] {finding.package}: {finding.cve_id or finding.fingerprint}",
+            body=finding.summary, fingerprint=finding.fingerprint, labels=[],
+        )
+        store.set_finding_issue(
+            _conn, finding_id, issue_number=issue["number"], issue_url=issue["html_url"],
+        )
+        row = store.get_finding(_conn, finding_id)
+
+    if row["status"] != "new":
+        return False  # already claimed/dispatching/done on an earlier scan
+
+    if not store.claim_finding_for_dispatch(_conn, finding_id):
+        return False  # lost a race to another concurrent scan run
+
+    try:
+        await _orchestrator.dispatch(finding, run_id=run_id)
+    except DispatchNotStartedError:
+        # No session was ever created - safe to make this retryable on the
+        # next scan rather than leaving it stuck forever.
+        logger.exception("dispatch never started for %s - reverting for retry", finding.fingerprint)
+        store.update_finding_status(_conn, finding_id, "new")
+        return False
+    except Exception:
+        # A session may already exist - do NOT revert the claim here, that
+        # risks a genuine duplicate session (the real 2026-08-17 incident).
+        # Leave it stuck in 'dispatching' for a human to investigate.
+        logger.exception(
+            "dispatch failed after possibly starting a session for %s - not auto-retrying",
+            finding.fingerprint,
+        )
+        return False
+
+    return True
