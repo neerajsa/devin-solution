@@ -8,8 +8,11 @@ import tempfile
 from dataclasses import dataclass
 
 import httpx
+from packaging.version import InvalidVersion, Version
 
 OSV_API = "https://api.osv.dev/v1/vulns"
+
+SEVERITY_RANK = {"unrated": 0, "low": 1, "moderate": 2, "medium": 2, "high": 3, "critical": 4}
 
 
 @dataclass
@@ -53,12 +56,23 @@ def parse_pip_audit(raw: dict, *, client: httpx.Client | None = None) -> list[Fi
     PYSEC-2026-3447). Never guesses a fixed_version when fix_versions is
     empty - that's a real, observed case (paramiko/PYSEC-2026-2858) meaning
     no safe version is published, not missing data to fill in.
+
+    Packages with multiple distinct CVEs pinned at the same version (real,
+    observed: pip==25.1.1 has 5, mcp==1.24.0 has 3, python-multipart==0.0.29
+    has 3) are grouped into ONE Finding per (package, version) rather than
+    fanned out into one Finding - and one Devin session - per CVE, which
+    would otherwise dispatch several sessions racing to bump the exact same
+    pin. A package with exactly one CVE keeps the original single-CVE
+    fingerprint format unchanged (`{vuln_id}:{package}`) - the formula below
+    generalizes to it naturally by joining one sorted id instead of several -
+    so already-issued findings (setuptools, flask, paramiko, cryptography)
+    keep matching their real GitHub issue fingerprint markers.
     """
     owns_client = client is None
     client = client or httpx.Client()
     try:
         seen: set[tuple[str, str, str]] = set()
-        findings = []
+        grouped: dict[tuple[str, str], list[dict]] = {}
         for dep in raw.get("dependencies", []):
             package = dep["name"]
             version = dep["version"]
@@ -67,26 +81,56 @@ def parse_pip_audit(raw: dict, *, client: httpx.Client | None = None) -> list[Fi
                 if key in seen:
                     continue
                 seen.add(key)
+                grouped.setdefault((package, version), []).append(vuln)
 
-                fixed_versions = vuln.get("fix_versions") or []
-                aliases = vuln.get("aliases", [])
-                cve_id = next((a for a in aliases if a.startswith("CVE-")), None)
-
-                findings.append(Finding(
-                    fingerprint=f"{vuln['id'].lower()}:{package.lower()}",
-                    source="pip-audit",
-                    finding_class="dependency-cve",
-                    package=package,
-                    current_version=version,
-                    fixed_version=fixed_versions[0] if fixed_versions else None,
-                    cve_id=cve_id,
-                    severity=_severity_from_aliases(aliases, client),
-                    summary=vuln.get("description", "")[:500],
-                ))
-        return findings
+        return [
+            _finding_for_group(package, version, vulns, client)
+            for (package, version), vulns in grouped.items()
+        ]
     finally:
         if owns_client:
             client.close()
+
+
+def _finding_for_group(package: str, version: str, vulns: list[dict], client: httpx.Client) -> Finding:
+    vuln_ids = sorted(v["id"] for v in vulns)
+    fingerprint = f"{'+'.join(id_.lower() for id_ in vuln_ids)}:{package.lower()}"
+
+    all_aliases = [a for v in vulns for a in v.get("aliases", [])]
+    cve_ids = sorted({a for a in all_aliases if a.startswith("CVE-")})
+
+    return Finding(
+        fingerprint=fingerprint,
+        source="pip-audit",
+        finding_class="dependency-cve",
+        package=package,
+        current_version=version,
+        fixed_version=_combined_fixed_version(vulns),
+        cve_id=", ".join(cve_ids) if cve_ids else None,
+        severity=max(
+            (_severity_from_aliases(v.get("aliases", []), client) for v in vulns),
+            key=lambda s: SEVERITY_RANK.get(s, 0),
+        ),
+        summary="\n\n".join(f"{v['id']}: {v.get('description', '')[:500]}" for v in vulns),
+    )
+
+
+def _combined_fixed_version(vulns: list[dict]) -> str | None:
+    """The lowest version that resolves every vuln in the group - the max across
+    each vuln's own minimum fix version. None if any vuln in the group has no
+    published fix at all (never guess - see the module docstring), since no
+    single version then fixes the whole group.
+    """
+    firsts = []
+    for v in vulns:
+        fix_versions = v.get("fix_versions") or []
+        if not fix_versions:
+            return None
+        firsts.append(fix_versions[0])
+    try:
+        return max(firsts, key=Version)
+    except InvalidVersion:
+        return max(firsts)
 
 
 async def fetch_and_scan(repo: str, branch: str, paths: list[str], *,
