@@ -143,6 +143,13 @@ class Orchestrator:
                     # real, already-terminated result, not a gate on anything.
                     logger.exception("failed to trigger PR review for %s", result["pr_url"])
 
+            # Mirror the real terminal outcome onto the finding itself - without
+            # this, claim_finding_for_dispatch's 'new' -> 'dispatching' transition
+            # was the last update a finding's status ever received on a successful
+            # run, leaving it reading "dispatching" forever even though it's long
+            # done (real gap, found dispatching setuptools twice, 2026-08-19).
+            store.update_finding_status(self._conn, finding_id, result["state"])
+
             return result
 
     async def _poll_to_terminal(self, session_id: str, devin_session_id: str) -> dict:

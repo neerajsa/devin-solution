@@ -131,6 +131,12 @@ async def test_dispatch_remediated_with_pr_terminates_and_triggers_review(conn):
     assert row["state"] == "remediated"
     assert row["terminal_at"] is not None
 
+    # The finding's own status must mirror the real outcome, not stay stuck at
+    # 'dispatching' forever - real gap, found dispatching setuptools twice
+    # under this exact code path (2026-08-19).
+    finding_row = store.get_finding_by_fingerprint(conn, _cve_finding().fingerprint)
+    assert finding_row["status"] == "remediated"
+
 
 @pytest.mark.asyncio
 async def test_dispatch_needs_human_terminates_session_and_skips_review(conn):
@@ -178,6 +184,7 @@ async def test_dispatch_records_finding_and_records_evidence_based_history(conn)
     row = store.get_finding_by_fingerprint(conn, finding.fingerprint)
     assert row is not None
     assert row["package"] == "setuptools"
+    assert row["status"] == "not_applicable"
     assert fake.created["tags"] == [f"finding:{finding.fingerprint}", "run:run-1", "superset"]
 
 
