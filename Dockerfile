@@ -1,7 +1,15 @@
 FROM python:3.11-slim
 
+# pkg-config + default-libmysqlclient-dev: requirements/development.txt pins
+# mysqlclient, and pip-audit's own internal `pip install --dry-run` still
+# resolves build requirements for every listed package (--no-deps only skips
+# resolving *transitive* deps, not top-level ones) - without these, resolving
+# mysqlclient's build metadata fails outright and the scan never produces any
+# findings at all. Found live (2026-08-19) dispatching pytest for real - every
+# earlier verification of requirements/development.txt ran on the host (which
+# had these installed via Homebrew), never through this actual container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates \
+      ca-certificates pkg-config default-libmysqlclient-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
