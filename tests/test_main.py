@@ -77,11 +77,11 @@ def fresh_conn(monkeypatch):
 
 class FakeOrchestratorForScan:
     def __init__(self, *, fail_with: Exception | None = None):
-        self.dispatched: list[tuple[str, str]] = []
+        self.dispatched: list[tuple[str, str, int]] = []
         self._fail_with = fail_with
 
-    async def dispatch(self, finding, *, run_id):
-        self.dispatched.append((finding.fingerprint, run_id))
+    async def dispatch(self, finding, *, run_id, issue_number):
+        self.dispatched.append((finding.fingerprint, run_id, issue_number))
         if self._fail_with:
             raise self._fail_with
         return {"state": "not_applicable", "pr_url": None}
@@ -119,7 +119,7 @@ async def test_file_and_dispatch_never_files_with_the_devin_autofix_label(monkey
     assert result is True
     assert len(fake_github.filed) == 1
     assert fake_github.filed[0]["labels"] == []
-    assert fake_orch.dispatched == [(finding.fingerprint, "run-1")]
+    assert fake_orch.dispatched == [(finding.fingerprint, "run-1", 101)]
 
 
 @pytest.mark.asyncio
@@ -140,7 +140,7 @@ async def test_file_and_dispatch_skips_refiling_but_retries_dispatch_if_still_ne
 
     assert result is True
     assert fake_github.filed == []  # already had an issue from an earlier scan - not re-filed
-    assert fake_orch.dispatched == [(finding.fingerprint, "run-1")]
+    assert fake_orch.dispatched == [(finding.fingerprint, "run-1", 2)]
 
 
 @pytest.mark.asyncio

@@ -120,7 +120,7 @@ async def test_dispatch_remediated_with_pr_terminates_and_triggers_review(conn):
     ])
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
-    result = await orch.dispatch(_cve_finding(), run_id="run-1")
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     assert result["state"] == "remediated"
     assert result["pr_url"] == "https://github.com/x/y/pull/1"
@@ -140,7 +140,7 @@ async def test_dispatch_needs_human_terminates_session_and_skips_review(conn):
     ])
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
-    result = await orch.dispatch(_cve_finding(), run_id="run-1")
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     assert result["state"] == "needs_human"
     assert fake.terminated == [("devin-1", True)]
@@ -157,7 +157,7 @@ async def test_dispatch_blocked_nudges_once_then_times_out_to_needs_human(conn):
         devin_client=fake, conn=conn, repo="x/y", poll_interval=0, blocked_nudge_timeout=0,
     )
 
-    result = await orch.dispatch(_cve_finding(), run_id="run-1")
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     assert result["state"] == "needs_human"
     assert len(fake.messages_sent) == 1  # nudged exactly once, not repeatedly
@@ -173,7 +173,7 @@ async def test_dispatch_records_finding_and_records_evidence_based_history(conn)
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     finding = _cve_finding()
-    await orch.dispatch(finding, run_id="run-1")
+    await orch.dispatch(finding, run_id="run-1", issue_number=7)
 
     row = store.get_finding_by_fingerprint(conn, finding.fingerprint)
     assert row is not None
@@ -196,7 +196,7 @@ async def test_dispatch_review_trigger_failure_does_not_affect_result(conn):
     ])
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
-    result = await orch.dispatch(_cve_finding(), run_id="run-1")
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     assert result["state"] == "remediated"
     assert fake.terminated == [("devin-1", True)]
@@ -220,7 +220,7 @@ async def test_dispatch_failure_before_session_created_raises_not_started_error(
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     with pytest.raises(orchestrator.DispatchNotStartedError):
-        await orch.dispatch(_cve_finding(), run_id="run-1")
+        await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     # No session row should exist - nothing was ever created to record.
     assert fake.terminated == []
@@ -236,7 +236,7 @@ async def test_dispatch_failure_after_session_created_does_not_raise_not_started
     orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
 
     with pytest.raises(RuntimeError) as exc_info:
-        await orch.dispatch(_cve_finding(), run_id="run-1")
+        await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
 
     # A real session was already created before the failure - must NOT be
     # classified as safe-to-retry, and the original error must propagate as-is

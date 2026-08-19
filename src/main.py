@@ -177,10 +177,10 @@ async def _handle_issue_finding(issue: dict) -> None:
         return
 
     run_id = store.start_run(_conn, trigger="issue_labeled")
-    asyncio.create_task(_dispatch(_finding_from_row(finding_row), run_id))
+    asyncio.create_task(_dispatch(_finding_from_row(finding_row), run_id, issue["number"]))
 
 
-async def _dispatch(finding: Finding, run_id: str) -> None:
+async def _dispatch(finding: Finding, run_id: str, issue_number: int) -> None:
     # This runs as a fire-and-forget background task (asyncio.create_task) so
     # the webhook response isn't blocked on a multi-minute Devin session. A
     # failure anywhere in here would otherwise only surface via asyncio's
@@ -194,7 +194,7 @@ async def _dispatch(finding: Finding, run_id: str) -> None:
     # returning, so there's nothing further to do here after it returns.
     sessions_count = 0
     try:
-        await _orchestrator.dispatch(finding, run_id=run_id)
+        await _orchestrator.dispatch(finding, run_id=run_id, issue_number=issue_number)
         sessions_count = 1
     except DispatchNotStartedError:
         # No session was ever created - safe to make this retryable (e.g. a
@@ -280,7 +280,7 @@ async def _file_and_dispatch(finding: Finding, run_id: str) -> bool:
         return False  # lost a race to another concurrent scan run
 
     try:
-        await _orchestrator.dispatch(finding, run_id=run_id)
+        await _orchestrator.dispatch(finding, run_id=run_id, issue_number=row["issue_number"])
     except DispatchNotStartedError:
         # No session was ever created - safe to make this retryable on the
         # next scan rather than leaving it stuck forever.

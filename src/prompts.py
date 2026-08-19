@@ -20,10 +20,48 @@ STRUCTURED_OUTPUT_SCHEMA = {
     },
 }
 
+# Shared verbatim across every finding class, so a change here applies to every
+# prompt at once instead of needing separate, driftable edits per class - the
+# exact problem that motivated pulling these out (2026-08-18).
 
-def render_dependency_cve_prompt(finding: Finding, *, repo: str, branch: str, run_id: str) -> str:
+AUTONOMY_INSTRUCTION = """\
+You are operating fully autonomously - no human is monitoring this session or
+available to answer questions. Do not pause to ask a clarifying question or
+wait for approval on a judgment call. Make the best-supported decision
+yourself and note any uncertainty in your final summary; if you genuinely
+cannot proceed without a human decision, stop immediately and return status
+"needs_human" explaining why, rather than waiting."""
+
+
+def communicate_result_block(issue_number: int) -> str:
+    return f"""COMMUNICATE YOUR RESULT
+  Whatever the outcome - a PR opened, or a decision that no PR is needed -
+  post ONE comment on issue #{issue_number} in this repo explaining what you
+  found and what you did (or, if you didn't act, why not). This is the
+  primary way a human learns the outcome, so write it standalone: don't
+  assume they've read the PR, this session, or anything else.
+
+  Return your result against the provided structured output schema."""
+
+
+def render_dependency_cve_prompt(finding: Finding, *, repo: str, branch: str,
+                                  run_id: str, issue_number: int) -> str:
+    # An issue for this finding already exists by the time this prompt is
+    # rendered - main.py's scanner path (_file_and_dispatch) files a plain
+    # tracking issue itself, deterministically, before ever calling dispatch().
+    # Devin is never asked to create it: we need the issue number back
+    # synchronously, before dispatch, for our own fingerprint-marker dedup
+    # system - if Devin created it instead we'd only learn the number after
+    # the session finished, adding parsing/coupling on our side for something
+    # that's pure mechanical record-keeping, not a judgment call. Revisit this
+    # split if the tracking-issue format ever needs to be richer than a raw
+    # scan summary - at that point having Devin author it directly might be
+    # worth the coupling cost.
     fixed_in = finding.fixed_version or "none published"
     return f"""You are remediating security finding {finding.fingerprint} in {repo} on branch {branch}.
+This finding is tracked in issue #{issue_number} of this repo.
+
+{AUTONOMY_INSTRUCTION}
 
 FINDING
   Package:  {finding.package}, pinned at {finding.current_version}
@@ -56,8 +94,9 @@ TASK
   6. Open a PR against {branch} of {repo}, titled
      `fix({finding.package}): bump to <version> for {finding.cve_id}`.
      The body must include: the CVE summary, the breaking changes you handled
-     (or "none"), every file you modified, and the exact test command with its
-     output.
+     (or "none"), every file you modified, the exact test command with its
+     output, and a reference to issue #{issue_number} (e.g. "Fixes #{issue_number}")
+     so it closes automatically on merge.
 
 CONSTRAINTS
   - One finding per PR. Do not bump unrelated dependencies.
@@ -67,11 +106,15 @@ CONSTRAINTS
   - Stay within the session ACU cap. If you are approaching it without a clear
     path, stop and return "needs_human" describing what blocked you.
 
-Return your result against the provided structured output schema."""
+{communicate_result_block(issue_number)}"""
 
 
-def render_reported_issue_prompt(finding: Finding, *, repo: str, branch: str, run_id: str) -> str:
+def render_reported_issue_prompt(finding: Finding, *, repo: str, branch: str,
+                                  run_id: str, issue_number: int) -> str:
     return f"""You are investigating a human-reported issue in {repo} on branch {branch}.
+This report is issue #{issue_number} of this repo.
+
+{AUTONOMY_INSTRUCTION}
 
 REPORT
   Source:  {finding.source}, run {run_id}
@@ -96,7 +139,9 @@ TASK
      `pre-commit run --files <changed files>`.
   6. Open a PR against {branch} of {repo}. The body must include: the root
      cause you found, the regression test you added, every file you
-     modified, and the exact test command with its output.
+     modified, the exact test command with its output, and a reference to
+     issue #{issue_number} (e.g. "Fixes #{issue_number}") so it closes
+     automatically on merge.
 
 CONSTRAINTS
   - One issue per PR. Do not fix unrelated bugs you happen to notice.
@@ -106,7 +151,7 @@ CONSTRAINTS
   - Stay within the session ACU cap. If you are approaching it without a clear
     path, stop and return "needs_human" describing what blocked you.
 
-Return your result against the provided structured output schema."""
+{communicate_result_block(issue_number)}"""
 
 
 RENDERERS = {

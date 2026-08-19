@@ -86,7 +86,7 @@ class Orchestrator:
         self._blocked_nudge_timeout = blocked_nudge_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
-    async def dispatch(self, finding: Finding, *, run_id: str) -> dict:
+    async def dispatch(self, finding: Finding, *, run_id: str, issue_number: int) -> dict:
         """Create/reuse the finding record, dispatch a Devin session, poll to a terminal outcome.
 
         A real PR is the completion signal - the session terminates as soon as
@@ -94,6 +94,13 @@ class Orchestrator:
         gate before anything merges, and Devin Review (triggered below,
         fire-and-forget) gives them an automated second opinion to read
         alongside it - we don't block termination on either.
+
+        `issue_number` is always for an issue that already exists by the time
+        this is called (main.py guarantees this on both dispatch paths) - it's
+        threaded into the prompt so Devin can reference and comment on it
+        directly, rather than our own code parsing structured_output and
+        posting on Devin's behalf (see prompts.py's COMMUNICATE YOUR RESULT
+        block and its own comment for the full reasoning, 2026-08-18).
         """
         finding_id = store.insert_finding(
             self._conn, fingerprint=finding.fingerprint, source=finding.source,
@@ -105,7 +112,10 @@ class Orchestrator:
 
         async with self._semaphore:
             try:
-                prompt = prompts.render_prompt(finding, repo=self._repo, branch=self._branch, run_id=run_id)
+                prompt = prompts.render_prompt(
+                    finding, repo=self._repo, branch=self._branch, run_id=run_id,
+                    issue_number=issue_number,
+                )
                 raw = await self._devin.create_session(
                     prompt=prompt,
                     title=f"{finding.finding_class}: {finding.summary[:60]}",
@@ -148,6 +158,21 @@ class Orchestrator:
                 continue
 
             if state == "blocked":
+                # TEMPORARY / KNOWN AREA FOR OPTIMIZATION (2026-08-18): this is a
+                # content-free nudge - it never reads what Devin is actually
+                # waiting on (GET .../messages would show that) before replying,
+                # and can't distinguish a genuine platform-level safe-mode gate
+                # (status_detail == "waiting_for_approval", possibly not even
+                # under Devin's own discretion - a documented `bypass_approval`
+                # session-creation field exists but is undocumented in behavior
+                # and unverified, so not adopted here) from Devin choosing to
+                # pause and ask a question (status_detail == "waiting_for_user").
+                # The AUTONOMY_INSTRUCTION added to every prompt (prompts.py)
+                # should make the latter rare by telling Devin upfront to never
+                # wait for a human and to return needs_human instead - this nudge
+                # is kept only as a defensive fallback for whatever it doesn't
+                # catch, not as the primary mechanism. Revisit if it turns out to
+                # still fire often once real dispatches accumulate.
                 if nudged_at is None:
                     await self._devin.send_message(
                         devin_session_id,
