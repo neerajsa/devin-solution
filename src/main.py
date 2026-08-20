@@ -21,6 +21,17 @@ from scanners import Finding, fetch_and_scan
 
 SCAN_TARGETS = ["requirements/base.txt", "requirements/development.txt"]
 
+# Demo-only, deliberately isolated from SCAN_TARGETS above: a full scan can
+# surface several CVEs at once (real example: base.txt alone has 4), which
+# is fine for production but not for a fast, deterministic, low-cost demo.
+# Scans only base.txt (fewer packages, no development.txt/mysqlclient build
+# dependency) and dispatches only DEMO_CVE_PACKAGE - setuptools, the
+# empirically fastest and cheapest real dispatch seen so far (2.3-3.6 min
+# across two real runs). Shares no state with SCAN_TARGETS/_scan_and_file;
+# see /scan/run-demo below.
+DEMO_SCAN_TARGET = ["requirements/base.txt"]
+DEMO_CVE_PACKAGE = "setuptools"
+
 app = FastAPI(title="Devin Remediation Pipeline")
 logger = logging.getLogger("main")
 
@@ -72,6 +83,21 @@ async def scan_run(request: Request) -> dict[str, str]:
 
     run_id = store.start_run(_conn, trigger="manual_scan")
     asyncio.create_task(_scan_and_file(run_id))
+    return {"status": "accepted", "run_id": run_id}
+
+
+@app.post("/scan/run-demo")
+async def scan_run_demo(request: Request) -> dict[str, str]:
+    # Demo-only entry point: same auth, same fire-and-forget shape as
+    # /scan/run above, but dispatches through _scan_and_file_demo instead -
+    # a fast, deterministic, single-CVE path for a live walkthrough, kept
+    # fully separate from the production scan so nothing here can affect it.
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {_cfg.webhook_secret}":
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    run_id = store.start_run(_conn, trigger="manual_scan_demo")
+    asyncio.create_task(_scan_and_file_demo(run_id))
     return {"status": "accepted", "run_id": run_id}
 
 
@@ -234,6 +260,39 @@ async def _scan_and_file(run_id: str) -> None:
                 logger.exception("failed to process scanner finding %s", finding.fingerprint)
     except Exception:
         logger.exception("scan run %s failed", run_id)
+    finally:
+        store.finish_run(_conn, run_id, findings_count=findings_count, sessions_count=sessions_count)
+
+
+async def _scan_and_file_demo(run_id: str) -> None:
+    # Demo-only counterpart to _scan_and_file above - deliberately does not
+    # call it or share its SCAN_TARGETS, so nothing about production scan
+    # behavior changes by this function existing. Scans DEMO_SCAN_TARGET,
+    # picks out exactly the one finding matching DEMO_CVE_PACKAGE, and
+    # dispatches only that one through the same real _file_and_dispatch
+    # production code every other trigger path uses - the dispatch itself
+    # is genuine, only the selection is demo-scoped.
+    findings_count = 0
+    sessions_count = 0
+    try:
+        async with httpx.AsyncClient() as client:
+            findings = await fetch_and_scan(
+                _cfg.github_repo, "master", DEMO_SCAN_TARGET, client=client,
+            )
+        findings_count = len(findings)
+
+        target = next((f for f in findings if f.package == DEMO_CVE_PACKAGE), None)
+        if target is None:
+            logger.error(
+                "demo scan found no finding for package %r among %d findings - "
+                "nothing to dispatch (already remediated on this fork, or the "
+                "pin changed since DEMO_CVE_PACKAGE was chosen?)",
+                DEMO_CVE_PACKAGE, findings_count,
+            )
+        elif await _file_and_dispatch(target, run_id):
+            sessions_count = 1
+    except Exception:
+        logger.exception("demo scan run %s failed", run_id)
     finally:
         store.finish_run(_conn, run_id, findings_count=findings_count, sessions_count=sessions_count)
 

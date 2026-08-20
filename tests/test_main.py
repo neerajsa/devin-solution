@@ -195,3 +195,67 @@ async def test_file_and_dispatch_does_not_revert_status_on_other_errors(monkeypa
     assert result is False
     row = store.get_finding_by_fingerprint(fresh_conn, finding.fingerprint)
     assert row["status"] == "dispatching"
+
+
+# --- main._scan_and_file_demo - the fast, deterministic, single-CVE demo path ---
+#
+# Real design decision (2026-08-19): a full production scan can surface several
+# CVEs at once (real example: base.txt alone has 4), which is fine for production
+# but not for a live demo that needs to be fast and predictable. This is a
+# completely separate function from _scan_and_file, sharing no state with it -
+# these tests also pin down that production scanning is unaffected by this
+# function's existence.
+
+@pytest.mark.asyncio
+async def test_scan_and_file_demo_dispatches_only_the_target_package(monkeypatch, fresh_conn):
+    findings = [
+        _dependency_finding(package="flask", fingerprint="pysec-x:flask"),
+        _dependency_finding(package="setuptools", fingerprint="pysec-x:setuptools"),
+        _dependency_finding(package="paramiko", fingerprint="pysec-x:paramiko"),
+    ]
+
+    async def fake_fetch_and_scan(repo, branch, paths, *, client):
+        assert paths == main.DEMO_SCAN_TARGET  # never the production SCAN_TARGETS
+        return findings
+
+    fake_orch = FakeOrchestratorForScan()
+    fake_github = FakeGitHubClientForScan()
+    monkeypatch.setattr(main, "fetch_and_scan", fake_fetch_and_scan)
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+    monkeypatch.setattr(main, "_github_client", fake_github)
+
+    run_id = store.start_run(fresh_conn, trigger="manual_scan_demo")
+    await main._scan_and_file_demo(run_id)
+
+    assert [f for f, _, _ in fake_orch.dispatched] == ["pysec-x:setuptools"]
+    run = fresh_conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["findings_count"] == 3
+    assert run["sessions_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_and_file_demo_handles_target_not_found(monkeypatch, fresh_conn):
+    async def fake_fetch_and_scan(repo, branch, paths, *, client):
+        return [_dependency_finding(package="flask", fingerprint="pysec-x:flask")]
+
+    fake_orch = FakeOrchestratorForScan()
+    fake_github = FakeGitHubClientForScan()
+    monkeypatch.setattr(main, "fetch_and_scan", fake_fetch_and_scan)
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+    monkeypatch.setattr(main, "_github_client", fake_github)
+
+    run_id = store.start_run(fresh_conn, trigger="manual_scan_demo")
+    await main._scan_and_file_demo(run_id)  # must not raise
+
+    assert fake_orch.dispatched == []
+    run = fresh_conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["sessions_count"] == 0
+    assert run["findings_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_and_file_demo_does_not_affect_production_scan_targets():
+    # Regression guard: the two scan paths must never share a target list.
+    assert main.DEMO_SCAN_TARGET != main.SCAN_TARGETS
+    assert main.DEMO_SCAN_TARGET == ["requirements/base.txt"]
+    assert main.DEMO_CVE_PACKAGE == "setuptools"
