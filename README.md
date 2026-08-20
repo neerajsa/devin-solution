@@ -74,7 +74,7 @@ make verify-clean
 | `make demo-issue` | File a real, `devin-autofix`-labeled GitHub issue for a fast live walkthrough (see [Demo and evidence](#demo-and-evidence)). |
 | `make demo-scan` | Trigger a fast, single-CVE scan of `requirements/base.txt` only. |
 | `make verify-clean` | Fresh clone, full rebuild, healthcheck. |
-| `make dashboard` | Print and open the live dashboard: autonomy rate, PR-open rate, latency, cost estimate, failure taxonomy, backlog burndown. |
+| `make dashboard` | Print and open the live dashboard: autonomy rate, PR-open rate, latency, cost estimate, failure taxonomy. |
 | `make register-webhook URL=<tunnel-url>` | Register a real GitHub webhook against a running `make tunnel`, enabling the human-reported-bug trigger path. |
 
 To enable the human-reported-bug trigger path: run `make tunnel` in one terminal, copy the URL it prints, then run `make register-webhook URL=<that-url>` in another. Repo, secret, and event type are all pulled from `.env` automatically; the URL is the only piece that can't be, since `cloudflared` assigns a new one every time it starts. From then on, filing or labeling any issue `devin-autofix` dispatches a real session automatically.
@@ -212,17 +212,20 @@ devin-solution/
 
 ![Dashboard screenshot](assets/dashboard.png)
 
-`GET /dashboard` renders five stat cards and one chart, computed from real session data.
+`GET /dashboard` renders five stat cards, computed from real session data.
 
 | Metric | What it shows | Real or estimated |
 |---|---|---|
-| Autonomy rate | % of successful sessions needing zero human messages | Real |
-| PR-open rate | % of terminal sessions that produced a real PR | Real |
+| Autonomy rate | % of **every terminal** session that reached a real successful outcome (`remediated`/`partially_remediated`/`not_applicable`) with zero human messages | Real |
+| PR-open rate | % of **every terminal** session, refusals and duds included, that produced a real PR | Real |
 | Latency (p50 / p95) | Time from dispatch to a terminal outcome | Real |
 | Human-hours saved | Time saved against a baseline | **Estimated.** The baseline (45 min for a CVE triage, 90 min for a bug diagnosis) is a stated assumption, not a measurement, and is labeled as such on the dashboard. |
 | Est. cost per merged fix | Dollar cost per successful fix | **Estimated.** Devin's `acus_consumed` field reads 0 for this account tier (self-serve, billed differently than enterprise), so this is a duration-based heuristic calibrated against one known real charge, always labeled "not real billing data." |
 | Failure taxonomy | Counts of `blocked`, `no_pr`, `needs_human` | Real |
-| Backlog burndown (chart) | Findings by status, over time | Real, a time series built from real status-transition snapshots. |
+
+Autonomy rate and PR-open rate share the same denominator (every terminal session, regardless of which trigger dispatched it) and ask different questions over it: PR-open rate asks "did it produce a PR," autonomy rate asks "did it produce a real successful outcome with zero human messages." A `needs_human` refusal or a no-PR dud counts against autonomy rate - an earlier version excluded refusals from its denominator entirely, which meant they could never drag the rate down and it was structurally biased toward 100%; caught on review and fixed. Both cards show their real sample size (e.g. "10 of 12") on the dashboard itself.
+
+A backlog-burndown chart was tried twice (see `src/dashboard.py`'s module docstring) and removed both times: with the actual number of findings a project like this produces, a time-series chart didn't earn its place over just reading the findings table below the stat cards.
 
 ---
 

@@ -104,35 +104,6 @@ def test_findings_with_sessions_orders_newest_finding_first(conn):
     assert [r["fingerprint"] for r in rows] == ["f-newer", "f-older"]
 
 
-# --- _render_backlog_chart_svg ---
-
-def test_render_backlog_chart_svg_empty_series_renders_a_message_not_an_empty_chart():
-    html = dashboard._render_backlog_chart_svg([])
-    assert "<svg" not in html
-    assert "No backlog history" in html
-
-
-def test_render_backlog_chart_svg_renders_open_vs_resolved():
-    # [REVISED 2026-08-20] Simplified from one polyline per findings.status
-    # value to two buckets - open (new/dispatching) vs. resolved (every real
-    # terminal outcome) - matching the chart's original spec and real
-    # feedback that a 7-color, axis-less chart was hard to read.
-    series = [
-        {"taken_at": 1755640000.0, "status": "new", "n": 3},
-        {"taken_at": 1755650000.0, "status": "new", "n": 2},
-        {"taken_at": 1755640000.0, "status": "remediated", "n": 0},
-        {"taken_at": 1755650000.0, "status": "remediated", "n": 1},
-        {"taken_at": 1755650000.0, "status": "needs_human", "n": 1},
-    ]
-    html = dashboard._render_backlog_chart_svg(series)
-    assert "<svg" in html
-    assert html.count("<polyline") == 2  # exactly one for "open", one for "resolved"
-    assert "open" in html and "resolved" in html
-    # needs_human never appears as its own line - it's folded into "resolved".
-    assert "needs_human" not in html
-    # Real axis labels: a numeric y-axis scale and real calendar dates on x.
-    assert "<text" in html
-
 
 # --- full endpoint ---
 

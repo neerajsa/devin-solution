@@ -59,7 +59,7 @@
       border: 1px solid var(--line);
       border-radius: 10px;
       overflow: hidden;
-      margin-bottom: 1px;
+      margin-bottom: 2rem;
     }
 
     .stat { background: var(--surface); padding: 1.1rem 1.15rem 1rem; }
@@ -94,29 +94,6 @@
     .failure-row { display: flex; justify-content: space-between; font-size: 0.85rem; }
     .failure-row .n { font-family: ui-monospace, monospace; font-weight: 600; }
     .failure-row.zero { color: var(--ink-faint); }
-
-    .chart-panel {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-top: none;
-      padding: 1.5rem 1.5rem 1.15rem;
-      border-radius: 0 0 10px 10px;
-      margin-bottom: 2rem;
-    }
-
-    .chart-panel .label {
-      font-family: ui-monospace, monospace;
-      font-size: 0.68rem;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--ink-faint);
-      margin-bottom: 0.9rem;
-    }
-
-    .chart-legend { display: flex; flex-wrap: wrap; gap: 1.1rem; font-size: 0.78rem; color: var(--ink-muted); margin-top: 0.75rem; }
-    .legend-item { display: inline-flex; align-items: center; gap: 0.4rem; }
-    .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
-    .muted { color: var(--ink-faint); }
 
     h2 {
       font-size: 1.05rem;
@@ -186,12 +163,14 @@
       <div class="stat">
         <div class="label">Autonomy rate</div>
         <div class="value">{{ "%.0f%%"|format(m.autonomy_rate * 100) if m.autonomy_rate is not none else "n/a" }}</div>
-        <div class="sub">{{ m.autonomy_counts.n }} of {{ m.autonomy_counts.total }} successful sessions</div>
+        <div class="sub">{{ m.autonomy_counts.n }} of {{ m.autonomy_counts.total }} terminal sessions</div>
+        <div class="caveat">resolved with zero human messages - a needs_human or no_pr session counts against this</div>
       </div>
       <div class="stat">
         <div class="label">PR-open rate</div>
         <div class="value">{{ "%.0f%%"|format(m.pr_open_rate * 100) if m.pr_open_rate is not none else "n/a" }}</div>
         <div class="sub">{{ m.pr_open_counts.n }} of {{ m.pr_open_counts.total }} terminal sessions</div>
+        <div class="caveat">same pool as autonomy rate - did it produce a PR at all, whether or not it needed a human</div>
       </div>
       <div class="stat">
         <div class="label">Latency (p50 / p95)</div>
@@ -217,11 +196,6 @@
           {% endfor %}
         </div>
       </div>
-    </div>
-
-    <div class="chart-panel">
-      <div class="label">Backlog burndown &middot; findings by status, over time</div>
-      {{ backlog_chart_svg | safe }}
     </div>
 
     <h2>Findings</h2>

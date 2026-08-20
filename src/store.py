@@ -55,12 +55,6 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id TEXT PRIMARY KEY,
     received_at REAL NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS backlog_snapshots (
-    taken_at REAL NOT NULL,
-    status   TEXT NOT NULL,
-    n        INTEGER NOT NULL
-);
 """
 
 
@@ -109,28 +103,12 @@ def get_finding(conn: sqlite3.Connection, finding_id: str) -> sqlite3.Row | None
     return conn.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
 
 
-def record_backlog_snapshot(conn: sqlite3.Connection) -> None:
-    """Append-only GROUP BY status snapshot of findings, written on every status
-    transition (see update_finding_status/claim_finding_for_dispatch below). This is
-    the event-driven capture mechanism backlog_burndown_series reads for the
-    dashboard's chart - no separate scheduler/polling loop.
-    """
-    now = time.time()
-    rows = conn.execute("SELECT status, COUNT(*) as n FROM findings GROUP BY status").fetchall()
-    conn.executemany(
-        "INSERT INTO backlog_snapshots (taken_at, status, n) VALUES (?, ?, ?)",
-        [(now, row["status"], row["n"]) for row in rows],
-    )
-    conn.commit()
-
-
 def update_finding_status(conn: sqlite3.Connection, finding_id: str, status: str) -> None:
     conn.execute(
         "UPDATE findings SET status = ?, updated_at = ? WHERE id = ?",
         (status, time.time(), finding_id),
     )
     conn.commit()
-    record_backlog_snapshot(conn)
 
 
 def claim_finding_for_dispatch(conn: sqlite3.Connection, finding_id: str) -> bool:
@@ -145,10 +123,7 @@ def claim_finding_for_dispatch(conn: sqlite3.Connection, finding_id: str) -> boo
         (time.time(), finding_id),
     )
     conn.commit()
-    claimed = cur.rowcount > 0
-    if claimed:
-        record_backlog_snapshot(conn)
-    return claimed
+    return cur.rowcount > 0
 
 
 def set_finding_issue(conn: sqlite3.Connection, finding_id: str, *,

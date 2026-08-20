@@ -15,27 +15,32 @@ def conn():
     c.close()
 
 
-def _add_session(conn, *, state: str, human_messages_sent: int = 0, ci_retries: int = 0):
+def _add_session(conn, *, state: str, human_messages_sent: int = 0, ci_retries: int = 0, terminal: bool = True):
     fid = store.insert_finding(
-        conn, fingerprint=f"f-{state}-{human_messages_sent}-{ci_retries}", source="pip-audit",
+        conn, fingerprint=f"f-{state}-{human_messages_sent}-{ci_retries}-{terminal}", source="pip-audit",
         finding_class="dependency-cve", severity="unrated", summary="s",
     )
     store.upsert_session(
         conn, session_id=None, finding_id=fid, devin_session_id="d", devin_url="u",
-        state=state, human_messages_sent=human_messages_sent, ci_retries=ci_retries,
+        state=state, human_messages_sent=human_messages_sent, ci_retries=ci_retries, terminal=terminal,
     )
 
 
-def test_autonomy_rate_only_counts_successful_states_with_zero_human_messages(conn):
+def test_autonomy_rate_counts_a_needs_human_refusal_against_it(conn):
+    # [REVISED 2026-08-20] Real bug, caught on review: the old denominator was
+    # SUCCESSFUL_STATES only, so a needs_human session never entered it at all
+    # and the rate was structurally biased toward 100%. The denominator is now
+    # every terminal session - a refusal now correctly counts against the rate,
+    # even though it never sent a human message either.
     _add_session(conn, state="remediated", human_messages_sent=0)
     _add_session(conn, state="remediated", human_messages_sent=1)  # needed a nudge
-    _add_session(conn, state="needs_human", human_messages_sent=0)  # not a successful state at all
+    _add_session(conn, state="needs_human", human_messages_sent=0)  # zero messages, but not a real completion
 
-    assert metrics.autonomy_rate(conn) == 0.5  # 1 of 2 successful states was fully autonomous
+    assert metrics.autonomy_rate(conn) == pytest.approx(1 / 3)  # 1 of 3 terminal sessions was fully autonomous
 
 
-def test_autonomy_rate_is_none_with_no_successful_sessions(conn):
-    _add_session(conn, state="needs_human")
+def test_autonomy_rate_is_none_with_no_terminal_sessions(conn):
+    _add_session(conn, state="needs_human", terminal=False)
     assert metrics.autonomy_rate(conn) is None
 
 
@@ -206,42 +211,3 @@ def test_latency_percentiles_hours_saved_floors_at_zero_when_slower_than_baselin
     _session_row(conn, state="remediated", duration_seconds=200 * 60)
     result = metrics.latency_percentiles(conn)
     assert result["est_human_hours_saved"] == 0.0
-
-
-# --- backlog_burndown_series ---
-#
-# [REVISED 2026-08-20] Reconstructed from real findings/sessions timestamps,
-# not read from backlog_snapshots - a pure snapshot-on-write table only
-# captured history from the moment that write path was deployed, which left
-# the real dashboard's chart showing a single collapsed point (a real,
-# reported gap). See metrics.py::backlog_burndown_series's docstring.
-
-def test_backlog_burndown_series_empty_with_no_findings(conn):
-    assert metrics.backlog_burndown_series(conn) == []
-
-
-def test_backlog_burndown_series_reconstructs_from_real_timestamps(conn):
-    fid = store.insert_finding(
-        conn, fingerprint="f-burndown", source="pip-audit",
-        finding_class="dependency-cve", severity="unrated", summary="s",
-    )
-    # A real session's own created_at/terminal_at are the source of truth for
-    # the 'dispatching' and terminal-state events - not a separate snapshot
-    # write path, so this reflects real history even predating this feature.
-    store.upsert_session(
-        conn, session_id=None, finding_id=fid,
-        devin_session_id="d1", devin_url="https://app.devin.ai/sessions/d1",
-        state="working",
-    )
-    session_id = conn.execute("SELECT id FROM sessions WHERE finding_id = ?", (fid,)).fetchone()["id"]
-    store.upsert_session(conn, session_id=session_id, state="remediated", terminal=True)
-
-    series = metrics.backlog_burndown_series(conn)
-    statuses_seen = {row["status"] for row in series}
-    assert "new" in statuses_seen        # the finding's own creation
-    assert "dispatching" in statuses_seen  # the session's creation
-    assert "remediated" in statuses_seen   # the session's real terminal state
-    assert all({"taken_at", "status", "n"} <= row.keys() for row in series)
-    # Chronological: the series should be able to show the backlog actually
-    # moving, not every point stacked at one timestamp.
-    assert len({row["taken_at"] for row in series}) > 1

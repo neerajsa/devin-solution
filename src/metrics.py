@@ -48,61 +48,28 @@ def backlog_burndown(conn) -> dict:
     return {row["status"]: row["n"] for row in rows}
 
 
-def backlog_burndown_series(conn) -> list[dict]:
-    """Time series of the open-vs-resolved backlog. Replaces the snapshot-only
-    backlog_burndown for the dashboard's chart slot; backlog_burndown itself can stay
-    as-is for any caller that only wants the current instantaneous counts.
-
-    Reconstructed from real finding/session timestamps rather than read from
-    backlog_snapshots: a snapshot-on-write table only captures history from the
-    moment that write path was deployed, which left the chart showing a single
-    collapsed point for any database with real history older than that (a real,
-    reported gap - 2026-08-20). Replaying findings.created_at ('new') and each
-    session's created_at ('dispatching') / terminal_at (its real terminal state)
-    in time order recovers the actual history that already happened, with no
-    dependency on when the snapshot table itself came into existence. Every
-    point here is a real status a real finding actually had at that real
-    moment - reconstructed, not fabricated.
-    """
-    findings = conn.execute("SELECT id, created_at FROM findings").fetchall()
-    sessions = conn.execute(
-        "SELECT finding_id, created_at, terminal_at, state FROM sessions"
-    ).fetchall()
-
-    events: list[tuple[float, str, str]] = []
-    for f in findings:
-        events.append((f["created_at"], f["id"], "new"))
-    for s in sessions:
-        events.append((s["created_at"], s["finding_id"], "dispatching"))
-        if s["terminal_at"] is not None:
-            events.append((s["terminal_at"], s["finding_id"], s["state"]))
-    events.sort(key=lambda e: e[0])
-
-    current: dict[str, str] = {}
-    series: list[dict] = []
-    for taken_at, finding_id, status in events:
-        current[finding_id] = status
-        counts: dict[str, int] = {}
-        for st in current.values():
-            counts[st] = counts.get(st, 0) + 1
-        for status_name, n in counts.items():
-            series.append({"taken_at": taken_at, "status": status_name, "n": n})
-    return series
-
-
 def _autonomy_counts(conn) -> tuple[int, int]:
-    rows = conn.execute(
-        "SELECT state, human_messages_sent FROM sessions WHERE state IN ({})".format(
-            ",".join("?" * len(SUCCESSFUL_STATES))
-        ),
-        list(SUCCESSFUL_STATES),
-    ).fetchall()
-    autonomous = sum(1 for r in rows if r["human_messages_sent"] == 0)
+    """[REVISED 2026-08-20] Denominator is every terminal session, not just the
+    ones in SUCCESSFUL_STATES - the earlier version excluded needs_human/no_pr/
+    blocked from the denominator entirely, so a refusal could never drag the
+    rate down and it was structurally biased toward 100% (real bug, caught on
+    review: paramiko's genuine needs_human refusal wasn't reflected at all). A
+    session only counts as autonomous if it BOTH reached a real successful
+    outcome AND needed zero human messages - a needs_human session now
+    correctly counts against the rate, since it didn't complete the work
+    without a human, even if no message was ever sent to it mid-session."""
+    rows = conn.execute("SELECT state, human_messages_sent FROM sessions WHERE terminal_at IS NOT NULL").fetchall()
+    autonomous = sum(
+        1 for r in rows if r["state"] in SUCCESSFUL_STATES and r["human_messages_sent"] == 0
+    )
     return autonomous, len(rows)
 
 
 def autonomy_rate(conn) -> float | None:
-    """% of sessions reaching a successful terminal state with zero human messages sent."""
+    """% of all terminal sessions that reached a real successful outcome
+    (remediated/partially_remediated/not_applicable) with zero human messages
+    sent - not just % of the successful ones that were clean. A needs_human
+    or no_pr session counts against this rate."""
     autonomous, total = _autonomy_counts(conn)
     if not total:
         return None
@@ -262,14 +229,23 @@ def failure_taxonomy(conn) -> dict:
 
 
 def all_metrics(conn) -> dict:
-    """5 stat cards + 1 chart = six metrics (docs/observability-improvement-proposal.md
-    Part 2). autonomy_rate/latency/failure_taxonomy are unchanged; pr_open_rate and
+    """Five stat cards (docs/observability-improvement-proposal.md Part 2, minus the
+    chart - see dashboard.py's module docstring for why it was removed, twice).
+    autonomy_rate/latency/failure_taxonomy are unchanged; pr_open_rate and
     estimated_cost_per_merged_fix replace the two broken metrics (first_pass_ci_rate/
-    cost_per_merged_fix - kept as functions for history, no longer surfaced here);
-    backlog_burndown_series replaces the snapshot-only backlog_burndown in the
-    dedicated chart slot. autonomy_counts/pr_open_counts expose the raw (n, total)
-    behind each rate, so the dashboard can show "100% (4/4)" instead of a bare
-    percentage with no sense of sample size."""
+    cost_per_merged_fix - kept as functions for history, no longer surfaced here).
+
+    autonomy_counts/pr_open_counts expose the raw (n, total) behind each rate, so the
+    dashboard can show "100% (9/9)" instead of a bare percentage with no sense of
+    sample size. [REVISED 2026-08-20] Both rates now share the same denominator -
+    every terminal session, regardless of outcome or trigger path - after a real
+    bug was caught on review: autonomy_rate used to only count sessions already in
+    SUCCESSFUL_STATES, so a needs_human refusal never entered its denominator at
+    all and the rate was structurally biased toward 100%. They still answer
+    different questions over that same pool: pr_open_rate asks "did it produce a
+    PR," autonomy_rate asks "did it produce a real successful outcome with zero
+    human messages" - a needs_human or no_pr session now correctly counts against
+    autonomy_rate too."""
     autonomy_n, autonomy_total = _autonomy_counts(conn)
     pr_open_n, pr_open_total = _pr_open_counts(conn)
     return {
@@ -280,5 +256,4 @@ def all_metrics(conn) -> dict:
         "latency": latency_percentiles(conn),
         "estimated_cost_per_merged_fix": estimated_cost_per_merged_fix(conn),
         "failure_taxonomy": failure_taxonomy(conn),
-        "backlog_burndown_series": backlog_burndown_series(conn),
     }
