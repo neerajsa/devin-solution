@@ -4,86 +4,255 @@
   <meta charset="utf-8">
   <title>Devin Remediation Pipeline</title>
   <style>
-    body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
-    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; }
-    .card .label { font-size: 0.85rem; color: #666; }
-    .card .value { font-size: 1.6rem; font-weight: 600; }
-    .card .sub { font-size: 0.85rem; color: #444; margin-top: 0.25rem; }
-    .caveat { font-size: 0.75rem; color: #888; font-style: italic; margin-top: 0.35rem; }
-    .chart-section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 2rem; }
-    .chart-section .label { font-size: 0.85rem; color: #666; margin-bottom: 0.5rem; }
-    .chart-legend { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.5rem; font-size: 0.8rem; color: #444; }
-    .legend-item { display: inline-flex; align-items: center; gap: 0.3rem; }
+    :root {
+      --ground: #0E1117;
+      --surface: #161A22;
+      --surface-2: #12151C;
+      --ink: #E8EAF0;
+      --ink-muted: #8A90A2;
+      --ink-faint: #5F6577;
+      --line: #262B36;
+      --line-strong: #333A48;
+      --accent: #8098FF;
+      --accent-soft: #1B2140;
+      --good: #34C77B;
+      --good-soft: #10281C;
+      --warn: #E0A83E;
+      --warn-soft: #2B2210;
+      --bad: #E5645A;
+      --bad-soft: #2C1614;
+      --neutral-state: #8A90A2;
+      --neutral-state-soft: #1B1E27;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--ground);
+      color: var(--ink);
+      font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+
+    .mono {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .page { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin: 0 0 1.5rem;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 1px;
+    }
+
+    .stat { background: var(--surface); padding: 1.1rem 1.15rem 1rem; }
+
+    .stat .label {
+      font-family: ui-monospace, monospace;
+      font-size: 0.68rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin-bottom: 0.55rem;
+    }
+
+    .stat .value {
+      font-family: ui-monospace, monospace;
+      font-size: 1.55rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .stat .sub { margin-top: 0.4rem; font-size: 0.76rem; color: var(--ink-muted); }
+
+    .stat .caveat {
+      margin-top: 0.5rem;
+      font-size: 0.68rem;
+      font-style: italic;
+      color: var(--ink-faint);
+      line-height: 1.4;
+    }
+
+    .failure-rows { display: flex; flex-direction: column; gap: 0.3rem; }
+    .failure-row { display: flex; justify-content: space-between; font-size: 0.85rem; }
+    .failure-row .n { font-family: ui-monospace, monospace; font-weight: 600; }
+    .failure-row.zero { color: var(--ink-faint); }
+
+    .chart-panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-top: none;
+      padding: 1.5rem 1.5rem 1.15rem;
+      border-radius: 0 0 10px 10px;
+      margin-bottom: 2rem;
+    }
+
+    .chart-panel .label {
+      font-family: ui-monospace, monospace;
+      font-size: 0.68rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin-bottom: 0.9rem;
+    }
+
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 1.1rem; font-size: 0.78rem; color: var(--ink-muted); margin-top: 0.75rem; }
+    .legend-item { display: inline-flex; align-items: center; gap: 0.4rem; }
     .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
-    .muted { color: #999; }
+    .muted { color: var(--ink-faint); }
+
+    h2 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin: 0 0 1rem;
+    }
+
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
-    .seeded { color: #b45309; }
-    .cont-cell { color: #bbb; }
-    .desc-cell { max-width: 320px; }
-    .na { color: #aaa; }
+    th {
+      text-align: left;
+      font-size: 0.68rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      padding: 0 0.7rem 0.6rem 0;
+      border-bottom: 1px solid var(--line);
+      font-weight: 600;
+    }
+    td {
+      text-align: left;
+      padding: 0.65rem 0.7rem 0.65rem 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.85rem;
+    }
+    tr:last-child td { border-bottom: none; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .seeded { color: var(--warn); }
+    .cont-cell { color: var(--ink-faint); }
+    .desc-cell { max-width: 320px; color: var(--ink-muted); }
+    .na { color: var(--ink-faint); }
+    .fp { font-family: ui-monospace, monospace; font-size: 0.78rem; }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 20px;
+      white-space: nowrap;
+    }
+    .status-chip .dot { width: 6px; height: 6px; border-radius: 50%; }
+    .status-chip.remediated, .status-chip.partially_remediated { background: var(--good-soft); color: var(--good); }
+    .status-chip.remediated .dot, .status-chip.partially_remediated .dot { background: var(--good); }
+    .status-chip.dispatching { background: var(--warn-soft); color: var(--warn); }
+    .status-chip.dispatching .dot { background: var(--warn); }
+    .status-chip.not_applicable { background: var(--neutral-state-soft); color: var(--neutral-state); }
+    .status-chip.not_applicable .dot { background: var(--neutral-state); }
+    .status-chip.new { background: var(--accent-soft); color: var(--accent); }
+    .status-chip.new .dot { background: var(--accent); }
+    .status-chip.needs_human, .status-chip.blocked, .status-chip.no_pr { background: var(--bad-soft); color: var(--bad); }
+    .status-chip.needs_human .dot, .status-chip.blocked .dot, .status-chip.no_pr .dot { background: var(--bad); }
+
+    @media (max-width: 900px) {
+      .stat-grid { grid-template-columns: repeat(2, 1fr); }
+    }
   </style>
 </head>
 <body>
-  <h1>Devin Remediation Pipeline</h1>
+  <div class="page">
+    <h1>Devin Remediation Pipeline</h1>
 
-  <div class="cards">
-    <div class="card">
-      <div class="label">Autonomy rate</div>
-      <div class="value">{{ "%.0f%%"|format(m.autonomy_rate * 100) if m.autonomy_rate is not none else "n/a" }}</div>
-    </div>
-    <div class="card">
-      <div class="label">PR-open rate</div>
-      <div class="value">{{ "%.0f%%"|format(m.pr_open_rate * 100) if m.pr_open_rate is not none else "n/a" }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Latency (p50 / p95)</div>
-      <div class="value">
-        {{ "%.0fs"|format(m.latency.p50_seconds) if m.latency.p50_seconds is not none else "n/a" }} /
-        {{ "%.0fs"|format(m.latency.p95_seconds) if m.latency.p95_seconds is not none else "n/a" }}
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="label">Autonomy rate</div>
+        <div class="value">{{ "%.0f%%"|format(m.autonomy_rate * 100) if m.autonomy_rate is not none else "n/a" }}</div>
+        <div class="sub">{{ m.autonomy_counts.n }} of {{ m.autonomy_counts.total }} successful sessions</div>
       </div>
-      <div class="sub">~{{ "%.1f"|format(m.latency.est_human_hours_saved) }}h saved vs. assumed baseline</div>
-      <div class="caveat">{{ m.latency.baseline_note }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Est. cost per merged fix</div>
-      <div class="value">
-        {{ "$%.2f"|format(m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix) if m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix is not none else "n/a" }}
+      <div class="stat">
+        <div class="label">PR-open rate</div>
+        <div class="value">{{ "%.0f%%"|format(m.pr_open_rate * 100) if m.pr_open_rate is not none else "n/a" }}</div>
+        <div class="sub">{{ m.pr_open_counts.n }} of {{ m.pr_open_counts.total }} terminal sessions</div>
       </div>
-      <div class="caveat">heuristic estimate, not real billing data - see docs/observability-improvement-proposal.md</div>
+      <div class="stat">
+        <div class="label">Latency (p50 / p95)</div>
+        <div class="value">
+          {{ "%.0fs"|format(m.latency.p50_seconds) if m.latency.p50_seconds is not none else "n/a" }} /
+          {{ "%.0fs"|format(m.latency.p95_seconds) if m.latency.p95_seconds is not none else "n/a" }}
+        </div>
+        <div class="sub">~{{ "%.1f"|format(m.latency.est_human_hours_saved) }}h saved vs. assumed baseline</div>
+        <div class="caveat">{{ m.latency.baseline_note }}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Est. cost per merged fix</div>
+        <div class="value">
+          {{ "$%.2f"|format(m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix) if m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix is not none else "n/a" }}
+        </div>
+        <div class="caveat">heuristic estimate, not real billing data</div>
+      </div>
+      <div class="stat">
+        <div class="label">Failure taxonomy</div>
+        <div class="failure-rows">
+          {% for state, n in m.failure_taxonomy.items() %}
+          <div class="failure-row {{ 'zero' if n == 0 else '' }}"><span>{{ state }}</span><span class="n">{{ n }}</span></div>
+          {% endfor %}
+        </div>
+      </div>
     </div>
-    <div class="card">
-      <div class="label">Failure taxonomy</div>
-      <div class="value">{% for state, n in m.failure_taxonomy.items() %}{{ state }}: {{ n }}&nbsp; {% endfor %}</div>
+
+    <div class="chart-panel">
+      <div class="label">Backlog burndown &middot; findings by status, over time</div>
+      {{ backlog_chart_svg | safe }}
     </div>
-  </div>
 
-  <div class="chart-section">
-    <div class="label">Backlog burndown (findings by status, over time)</div>
-    {{ backlog_chart_svg | safe }}
+    <h2>Findings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Fingerprint</th><th>Class</th><th>Package</th><th>Severity</th><th>Status</th>
+          <th>Issue</th><th>Description</th><th>Session</th><th>Devin session</th><th>PR</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in findings %}
+        <tr class="{{ 'seeded' if f.seeded and not f.is_continuation else '' }}">
+          <td class="fp {{ 'cont-cell' if f.is_continuation else '' }}">{{ f.fingerprint }}</td>
+          <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f['class'] }}</td>
+          <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.package or '' }}</td>
+          <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.severity }}</td>
+          <td class="{{ 'cont-cell' if f.is_continuation else '' }}">
+            <span class="status-chip {{ f.status }}"><span class="dot"></span>{{ f.status }}</span>
+          </td>
+          <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{% if f.issue_url %}<a href="{{ f.issue_url }}">#{{ f.issue_number }}</a>{% endif %}</td>
+          <td class="desc-cell {{ 'cont-cell' if f.is_continuation else '' }}" title="{{ f.summary_full }}">{{ f.summary_short }}</td>
+          <td>{% if not f.session_id %}<span class="na">n/a</span>{% else %}
+            <span class="status-chip {{ f.session_state }}"><span class="dot"></span>{{ f.session_state }}</span>
+          {% endif %}</td>
+          <td>{% if f.session_devin_url %}<a href="{{ f.session_devin_url }}">session</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
+          <td>{% if f.session_pr_url %}<a href="{{ f.session_pr_url }}">PR</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
-
-  <h2>Findings</h2>
-  <table>
-    <tr>
-      <th>Fingerprint</th><th>Class</th><th>Package</th><th>Severity</th><th>Status</th>
-      <th>Issue</th><th>Description</th><th>Session</th><th>Devin session</th><th>PR</th>
-    </tr>
-    {% for f in findings %}
-    <tr class="{{ 'seeded' if f.seeded and not f.is_continuation else '' }}">
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.fingerprint }}</td>
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f['class'] }}</td>
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.package or '' }}</td>
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.severity }}</td>
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.status }}</td>
-      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{% if f.issue_url %}<a href="{{ f.issue_url }}">#{{ f.issue_number }}</a>{% endif %}</td>
-      <td class="desc-cell {{ 'cont-cell' if f.is_continuation else '' }}" title="{{ f.summary_full }}">{{ f.summary_short }}</td>
-      <td>{% if not f.session_id %}<span class="na">n/a</span>{% else %}{{ f.session_state }}{% endif %}</td>
-      <td>{% if f.session_devin_url %}<a href="{{ f.session_devin_url }}">session</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
-      <td>{% if f.session_pr_url %}<a href="{{ f.session_pr_url }}">PR</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
-    </tr>
-    {% endfor %}
-  </table>
 </body>
 </html>

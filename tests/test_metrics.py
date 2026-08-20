@@ -39,6 +39,18 @@ def test_autonomy_rate_is_none_with_no_successful_sessions(conn):
     assert metrics.autonomy_rate(conn) is None
 
 
+def test_all_metrics_exposes_the_raw_counts_behind_both_rates(conn):
+    # A bare percentage has no sense of sample size ("100%" of 1 session reads
+    # very differently than "100%" of 40) - all_metrics surfaces the real
+    # (n, total) behind autonomy_rate and pr_open_rate for the dashboard.
+    _add_session(conn, state="remediated", human_messages_sent=0)
+    _add_session(conn, state="remediated", human_messages_sent=1)
+
+    m = metrics.all_metrics(conn)
+    assert m["autonomy_counts"] == {"n": 1, "total": 2}
+    assert m["autonomy_rate"] == 0.5
+
+
 def test_first_pass_ci_rate_always_none_now_ci_verification_is_retired(conn):
     # [REVISED 2026-08-17] CI verification (and the states that fed this metric)
     # was retired the same day it was built - see orchestrator.py's module
@@ -197,21 +209,39 @@ def test_latency_percentiles_hours_saved_floors_at_zero_when_slower_than_baselin
 
 
 # --- backlog_burndown_series ---
+#
+# [REVISED 2026-08-20] Reconstructed from real findings/sessions timestamps,
+# not read from backlog_snapshots - a pure snapshot-on-write table only
+# captured history from the moment that write path was deployed, which left
+# the real dashboard's chart showing a single collapsed point (a real,
+# reported gap). See metrics.py::backlog_burndown_series's docstring.
 
-def test_backlog_burndown_series_empty_with_no_snapshots(conn):
+def test_backlog_burndown_series_empty_with_no_findings(conn):
     assert metrics.backlog_burndown_series(conn) == []
 
 
-def test_backlog_burndown_series_reflects_recorded_snapshots(conn):
+def test_backlog_burndown_series_reconstructs_from_real_timestamps(conn):
     fid = store.insert_finding(
         conn, fingerprint="f-burndown", source="pip-audit",
         finding_class="dependency-cve", severity="unrated", summary="s",
     )
-    store.claim_finding_for_dispatch(conn, fid)  # 'new' -> 'dispatching', records a snapshot
-    store.update_finding_status(conn, fid, "remediated")  # records another snapshot
+    # A real session's own created_at/terminal_at are the source of truth for
+    # the 'dispatching' and terminal-state events - not a separate snapshot
+    # write path, so this reflects real history even predating this feature.
+    store.upsert_session(
+        conn, session_id=None, finding_id=fid,
+        devin_session_id="d1", devin_url="https://app.devin.ai/sessions/d1",
+        state="working",
+    )
+    session_id = conn.execute("SELECT id FROM sessions WHERE finding_id = ?", (fid,)).fetchone()["id"]
+    store.upsert_session(conn, session_id=session_id, state="remediated", terminal=True)
 
     series = metrics.backlog_burndown_series(conn)
     statuses_seen = {row["status"] for row in series}
-    assert "dispatching" in statuses_seen
-    assert "remediated" in statuses_seen
+    assert "new" in statuses_seen        # the finding's own creation
+    assert "dispatching" in statuses_seen  # the session's creation
+    assert "remediated" in statuses_seen   # the session's real terminal state
     assert all({"taken_at", "status", "n"} <= row.keys() for row in series)
+    # Chronological: the series should be able to show the backlog actually
+    # moving, not every point stacked at one timestamp.
+    assert len({row["taken_at"] for row in series}) > 1

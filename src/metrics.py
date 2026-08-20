@@ -51,25 +51,62 @@ def backlog_burndown(conn) -> dict:
 def backlog_burndown_series(conn) -> list[dict]:
     """Time series of the open-vs-resolved backlog. Replaces the snapshot-only
     backlog_burndown for the dashboard's chart slot; backlog_burndown itself can stay
-    as-is for any caller that only wants the current instantaneous counts."""
-    rows = conn.execute(
-        "SELECT taken_at, status, n FROM backlog_snapshots ORDER BY taken_at"
+    as-is for any caller that only wants the current instantaneous counts.
+
+    Reconstructed from real finding/session timestamps rather than read from
+    backlog_snapshots: a snapshot-on-write table only captures history from the
+    moment that write path was deployed, which left the chart showing a single
+    collapsed point for any database with real history older than that (a real,
+    reported gap - 2026-08-20). Replaying findings.created_at ('new') and each
+    session's created_at ('dispatching') / terminal_at (its real terminal state)
+    in time order recovers the actual history that already happened, with no
+    dependency on when the snapshot table itself came into existence. Every
+    point here is a real status a real finding actually had at that real
+    moment - reconstructed, not fabricated.
+    """
+    findings = conn.execute("SELECT id, created_at FROM findings").fetchall()
+    sessions = conn.execute(
+        "SELECT finding_id, created_at, terminal_at, state FROM sessions"
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    events: list[tuple[float, str, str]] = []
+    for f in findings:
+        events.append((f["created_at"], f["id"], "new"))
+    for s in sessions:
+        events.append((s["created_at"], s["finding_id"], "dispatching"))
+        if s["terminal_at"] is not None:
+            events.append((s["terminal_at"], s["finding_id"], s["state"]))
+    events.sort(key=lambda e: e[0])
+
+    current: dict[str, str] = {}
+    series: list[dict] = []
+    for taken_at, finding_id, status in events:
+        current[finding_id] = status
+        counts: dict[str, int] = {}
+        for st in current.values():
+            counts[st] = counts.get(st, 0) + 1
+        for status_name, n in counts.items():
+            series.append({"taken_at": taken_at, "status": status_name, "n": n})
+    return series
 
 
-def autonomy_rate(conn) -> float | None:
-    """% of sessions reaching a successful terminal state with zero human messages sent."""
+def _autonomy_counts(conn) -> tuple[int, int]:
     rows = conn.execute(
         "SELECT state, human_messages_sent FROM sessions WHERE state IN ({})".format(
             ",".join("?" * len(SUCCESSFUL_STATES))
         ),
         list(SUCCESSFUL_STATES),
     ).fetchall()
-    if not rows:
-        return None
     autonomous = sum(1 for r in rows if r["human_messages_sent"] == 0)
-    return autonomous / len(rows)
+    return autonomous, len(rows)
+
+
+def autonomy_rate(conn) -> float | None:
+    """% of sessions reaching a successful terminal state with zero human messages sent."""
+    autonomous, total = _autonomy_counts(conn)
+    if not total:
+        return None
+    return autonomous / total
 
 
 def first_pass_ci_rate(conn) -> float | None:
@@ -84,15 +121,21 @@ def first_pass_ci_rate(conn) -> float | None:
     return None
 
 
+def _pr_open_counts(conn) -> tuple[int, int]:
+    rows = conn.execute("SELECT pr_url FROM sessions WHERE terminal_at IS NOT NULL").fetchall()
+    with_pr = sum(1 for r in rows if r["pr_url"])
+    return with_pr, len(rows)
+
+
 def pr_open_rate(conn) -> float | None:
     """% of terminal sessions that produced a real pr_url. Replaces the permanently-
     None first_pass_ci_rate (CI verification retired, IMPLEMENTATION_PLAN.md #10/#8.4).
     Reuses the already-tracked pr_url column - no new instrumentation. Distinct from
     autonomy_rate: this counts any PR, whether or not a human message was needed."""
-    rows = conn.execute("SELECT pr_url FROM sessions WHERE terminal_at IS NOT NULL").fetchall()
-    if not rows:
+    with_pr, total = _pr_open_counts(conn)
+    if not total:
         return None
-    return sum(1 for r in rows if r["pr_url"]) / len(rows)
+    return with_pr / total
 
 
 def latency_percentiles(conn) -> dict:
@@ -224,10 +267,16 @@ def all_metrics(conn) -> dict:
     estimated_cost_per_merged_fix replace the two broken metrics (first_pass_ci_rate/
     cost_per_merged_fix - kept as functions for history, no longer surfaced here);
     backlog_burndown_series replaces the snapshot-only backlog_burndown in the
-    dedicated chart slot."""
+    dedicated chart slot. autonomy_counts/pr_open_counts expose the raw (n, total)
+    behind each rate, so the dashboard can show "100% (4/4)" instead of a bare
+    percentage with no sense of sample size."""
+    autonomy_n, autonomy_total = _autonomy_counts(conn)
+    pr_open_n, pr_open_total = _pr_open_counts(conn)
     return {
-        "autonomy_rate": autonomy_rate(conn),
-        "pr_open_rate": pr_open_rate(conn),
+        "autonomy_rate": (autonomy_n / autonomy_total) if autonomy_total else None,
+        "autonomy_counts": {"n": autonomy_n, "total": autonomy_total},
+        "pr_open_rate": (pr_open_n / pr_open_total) if pr_open_total else None,
+        "pr_open_counts": {"n": pr_open_n, "total": pr_open_total},
         "latency": latency_percentiles(conn),
         "estimated_cost_per_merged_fix": estimated_cost_per_merged_fix(conn),
         "failure_taxonomy": failure_taxonomy(conn),
