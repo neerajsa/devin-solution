@@ -1,4 +1,4 @@
-.PHONY: up test verify-clean tunnel scan dashboard demo-issue demo-scan
+.PHONY: up test verify-clean tunnel scan dashboard register-webhook demo-issue demo-scan
 
 up:           ; docker compose up --build
 test:         ; python -m pytest tests/
@@ -9,6 +9,24 @@ dashboard:
 	@URL="http://localhost:8000/dashboard?token=$$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)"; \
 	echo "$$URL"; \
 	(command -v open >/dev/null && open "$$URL") || (command -v xdg-open >/dev/null && xdg-open "$$URL") || true
+
+# Registers a real GitHub webhook pointed at a running `make tunnel`, so the
+# human-reported-bug trigger path works against your fork. The tunnel URL is
+# assigned fresh each time cloudflared starts, so it can't be hardcoded here -
+# run `make tunnel` first, copy the URL it prints, then:
+#   make register-webhook URL=https://xxxx.trycloudflare.com
+# Everything else (repo, secret, event type) is pulled from .env automatically.
+register-webhook:
+	@if [ -z "$(URL)" ]; then \
+	  echo "Usage: make register-webhook URL=<tunnel-url>  (get <tunnel-url> from a running make tunnel)"; \
+	  exit 1; \
+	fi
+	gh api "repos/$$(grep '^GITHUB_REPO=' .env | cut -d'=' -f2)/hooks" \
+	  -f name=web -f active=true \
+	  -F "config[url]=$(URL)/webhooks/github" \
+	  -F "config[content_type]=json" \
+	  -F "config[secret]=$$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)" \
+	  -f "events[]=issues"
 
 # Production scan: all of requirements/base.txt + requirements/development.txt.
 scan:

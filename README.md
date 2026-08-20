@@ -75,18 +75,9 @@ make verify-clean
 | `make demo-scan` | Trigger a fast, single-CVE scan of `requirements/base.txt` only. |
 | `make verify-clean` | Fresh clone, full rebuild, healthcheck. |
 | `make dashboard` | Print and open the live dashboard: autonomy rate, PR-open rate, latency, cost estimate, failure taxonomy, backlog burndown. |
+| `make register-webhook URL=<tunnel-url>` | Register a real GitHub webhook against a running `make tunnel`, enabling the human-reported-bug trigger path. |
 
-To enable the human-reported-bug trigger path, register a real webhook once `make tunnel` is running:
-
-```bash
-gh api repos/<owner>/<repo>/hooks -f name=web -f active=true \
-  -F "config[url]=<tunnel-url>/webhooks/github" \
-  -F "config[content_type]=json" \
-  -F "config[secret]=$WEBHOOK_SECRET" \
-  -f "events[]=issues"
-```
-
-From then on, filing or labeling any issue `devin-autofix` dispatches a real session automatically.
+To enable the human-reported-bug trigger path: run `make tunnel` in one terminal, copy the URL it prints, then run `make register-webhook URL=<that-url>` in another. Repo, secret, and event type are all pulled from `.env` automatically; the URL is the only piece that can't be, since `cloudflared` assigns a new one every time it starts. From then on, filing or labeling any issue `devin-autofix` dispatches a real session automatically.
 
 ---
 
