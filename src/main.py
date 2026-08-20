@@ -23,14 +23,17 @@ SCAN_TARGETS = ["requirements/base.txt", "requirements/development.txt"]
 
 # Demo-only, deliberately isolated from SCAN_TARGETS above: a full scan can
 # surface several CVEs at once (real example: base.txt alone has 4), which
-# is fine for production but not for a fast, deterministic, low-cost demo.
-# Scans only base.txt (fewer packages, no development.txt/mysqlclient build
-# dependency) and dispatches only DEMO_CVE_PACKAGE - setuptools, the
-# empirically fastest and cheapest real dispatch seen so far (2.3-3.6 min
-# across two real runs). Shares no state with SCAN_TARGETS/_scan_and_file;
-# see /scan/run-demo below.
+# is fine for production but not for a fast, low-cost demo. Scans only
+# base.txt first (fewer packages, no development.txt/mysqlclient build
+# dependency) and dispatches whichever finding pip-audit returns first that's
+# still dispatchable - not a named package. A fresh fork of current, real
+# apache/superset is a moving target (unlike this project's own static
+# working fork): a hardcoded package name could already be patched upstream,
+# or gone entirely, by the time someone runs this. Falls back to
+# development.txt only if base.txt comes back with zero findings that day.
+# Shares no state with SCAN_TARGETS/_scan_and_file; see /scan/run-demo below.
 DEMO_SCAN_TARGET = ["requirements/base.txt"]
-DEMO_CVE_PACKAGE = "setuptools"
+DEMO_SCAN_TARGET_FALLBACK = ["requirements/development.txt"]
 
 app = FastAPI(title="Devin Remediation Pipeline")
 logger = logging.getLogger("main")
@@ -267,11 +270,13 @@ async def _scan_and_file(run_id: str) -> None:
 async def _scan_and_file_demo(run_id: str) -> None:
     # Demo-only counterpart to _scan_and_file above - deliberately does not
     # call it or share its SCAN_TARGETS, so nothing about production scan
-    # behavior changes by this function existing. Scans DEMO_SCAN_TARGET,
-    # picks out exactly the one finding matching DEMO_CVE_PACKAGE, and
-    # dispatches only that one through the same real _file_and_dispatch
-    # production code every other trigger path uses - the dispatch itself
-    # is genuine, only the selection is demo-scoped.
+    # behavior changes by this function existing. Dispatches exactly one
+    # finding: whichever one pip-audit returns first that's still actually
+    # dispatchable (not already claimed by an earlier demo run), through the
+    # same real _file_and_dispatch production code every other trigger path
+    # uses - the dispatch itself is genuine, only "stop after one" is
+    # demo-scoped. Not pinned to a named package - see the constants above
+    # for why.
     findings_count = 0
     sessions_count = 0
     try:
@@ -279,18 +284,29 @@ async def _scan_and_file_demo(run_id: str) -> None:
             findings = await fetch_and_scan(
                 _cfg.github_repo, "master", DEMO_SCAN_TARGET, client=client,
             )
+            if not findings:
+                logger.warning(
+                    "demo scan found nothing in %s - falling back to %s",
+                    DEMO_SCAN_TARGET, DEMO_SCAN_TARGET_FALLBACK,
+                )
+                findings = await fetch_and_scan(
+                    _cfg.github_repo, "master", DEMO_SCAN_TARGET_FALLBACK, client=client,
+                )
         findings_count = len(findings)
 
-        target = next((f for f in findings if f.package == DEMO_CVE_PACKAGE), None)
-        if target is None:
+        for finding in findings:
+            try:
+                if await _file_and_dispatch(finding, run_id):
+                    sessions_count = 1
+                    break  # demo dispatches exactly one - stop at the first real dispatch
+            except Exception:
+                logger.exception("failed to process demo finding %s", finding.fingerprint)
+        else:
             logger.error(
-                "demo scan found no finding for package %r among %d findings - "
-                "nothing to dispatch (already remediated on this fork, or the "
-                "pin changed since DEMO_CVE_PACKAGE was chosen?)",
-                DEMO_CVE_PACKAGE, findings_count,
+                "demo scan found %d finding(s) but none were dispatchable "
+                "(all already claimed/done on this fork)",
+                findings_count,
             )
-        elif await _file_and_dispatch(target, run_id):
-            sessions_count = 1
     except Exception:
         logger.exception("demo scan run %s failed", run_id)
     finally:

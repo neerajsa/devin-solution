@@ -197,17 +197,21 @@ async def test_file_and_dispatch_does_not_revert_status_on_other_errors(monkeypa
     assert row["status"] == "dispatching"
 
 
-# --- main._scan_and_file_demo - the fast, deterministic, single-CVE demo path ---
+# --- main._scan_and_file_demo - the fast, low-cost, single-CVE demo path ---
 #
-# Real design decision (2026-08-19): a full production scan can surface several
-# CVEs at once (real example: base.txt alone has 4), which is fine for production
-# but not for a live demo that needs to be fast and predictable. This is a
-# completely separate function from _scan_and_file, sharing no state with it -
-# these tests also pin down that production scanning is unaffected by this
-# function's existence.
+# Real design decision (2026-08-19, revised): a full production scan can surface
+# several CVEs at once (real example: base.txt alone has 4), which is fine for
+# production but not for a live demo that needs to be fast and cheap. Originally
+# pinned to a named package (setuptools), but a fresh fork of current, real
+# apache/superset is a moving target - a hardcoded package name could already be
+# patched upstream by the time someone runs this. Revised to dispatch whichever
+# finding is first and still actually dispatchable, with a development.txt
+# fallback if base.txt is fully clean that day. This is a completely separate
+# function from _scan_and_file, sharing no state with it - these tests also pin
+# down that production scanning is unaffected by this function's existence.
 
 @pytest.mark.asyncio
-async def test_scan_and_file_demo_dispatches_only_the_target_package(monkeypatch, fresh_conn):
+async def test_scan_and_file_demo_dispatches_the_first_finding_only(monkeypatch, fresh_conn):
     findings = [
         _dependency_finding(package="flask", fingerprint="pysec-x:flask"),
         _dependency_finding(package="setuptools", fingerprint="pysec-x:setuptools"),
@@ -227,16 +231,77 @@ async def test_scan_and_file_demo_dispatches_only_the_target_package(monkeypatch
     run_id = store.start_run(fresh_conn, trigger="manual_scan_demo")
     await main._scan_and_file_demo(run_id)
 
-    assert [f for f, _, _ in fake_orch.dispatched] == ["pysec-x:setuptools"]
+    # First in list order, not a named package - and stops there, never
+    # tries setuptools/paramiko even though they're also real findings.
+    assert [f for f, _, _ in fake_orch.dispatched] == ["pysec-x:flask"]
     run = fresh_conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     assert run["findings_count"] == 3
     assert run["sessions_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_scan_and_file_demo_handles_target_not_found(monkeypatch, fresh_conn):
+async def test_scan_and_file_demo_skips_already_claimed_and_tries_the_next(monkeypatch, fresh_conn):
+    already_claimed = _dependency_finding(package="flask", fingerprint="pysec-x:flask")
+    finding_id = store.insert_finding(
+        fresh_conn, fingerprint=already_claimed.fingerprint, source=already_claimed.source,
+        finding_class=already_claimed.finding_class, severity=already_claimed.severity,
+        summary=already_claimed.summary,
+    )
+    store.claim_finding_for_dispatch(fresh_conn, finding_id)  # simulate an earlier demo run
+
+    findings = [already_claimed, _dependency_finding(package="setuptools", fingerprint="pysec-x:setuptools")]
+
     async def fake_fetch_and_scan(repo, branch, paths, *, client):
-        return [_dependency_finding(package="flask", fingerprint="pysec-x:flask")]
+        return findings
+
+    fake_orch = FakeOrchestratorForScan()
+    fake_github = FakeGitHubClientForScan()
+    monkeypatch.setattr(main, "fetch_and_scan", fake_fetch_and_scan)
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+    monkeypatch.setattr(main, "_github_client", fake_github)
+
+    run_id = store.start_run(fresh_conn, trigger="manual_scan_demo")
+    await main._scan_and_file_demo(run_id)
+
+    # Repeated demo runs progress through the list rather than getting stuck.
+    assert [f for f, _, _ in fake_orch.dispatched] == ["pysec-x:setuptools"]
+
+
+@pytest.mark.asyncio
+async def test_scan_and_file_demo_falls_back_to_development_txt_when_base_is_empty(monkeypatch, fresh_conn):
+    calls = []
+
+    async def fake_fetch_and_scan(repo, branch, paths, *, client):
+        calls.append(paths)
+        if paths == main.DEMO_SCAN_TARGET:
+            return []  # base.txt fully patched today
+        return [_dependency_finding(package="pytest", fingerprint="pysec-x:pytest")]
+
+    fake_orch = FakeOrchestratorForScan()
+    fake_github = FakeGitHubClientForScan()
+    monkeypatch.setattr(main, "fetch_and_scan", fake_fetch_and_scan)
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+    monkeypatch.setattr(main, "_github_client", fake_github)
+
+    run_id = store.start_run(fresh_conn, trigger="manual_scan_demo")
+    await main._scan_and_file_demo(run_id)
+
+    assert calls == [main.DEMO_SCAN_TARGET, main.DEMO_SCAN_TARGET_FALLBACK]
+    assert [f for f, _, _ in fake_orch.dispatched] == ["pysec-x:pytest"]
+
+
+@pytest.mark.asyncio
+async def test_scan_and_file_demo_handles_nothing_dispatchable_without_raising(monkeypatch, fresh_conn):
+    already_claimed = _dependency_finding(package="flask", fingerprint="pysec-x:flask")
+    finding_id = store.insert_finding(
+        fresh_conn, fingerprint=already_claimed.fingerprint, source=already_claimed.source,
+        finding_class=already_claimed.finding_class, severity=already_claimed.severity,
+        summary=already_claimed.summary,
+    )
+    store.claim_finding_for_dispatch(fresh_conn, finding_id)
+
+    async def fake_fetch_and_scan(repo, branch, paths, *, client):
+        return [already_claimed]  # only finding, and it's already claimed
 
     fake_orch = FakeOrchestratorForScan()
     fake_github = FakeGitHubClientForScan()
@@ -253,9 +318,8 @@ async def test_scan_and_file_demo_handles_target_not_found(monkeypatch, fresh_co
     assert run["findings_count"] == 1
 
 
-@pytest.mark.asyncio
-async def test_scan_and_file_demo_does_not_affect_production_scan_targets():
+def test_scan_and_file_demo_does_not_affect_production_scan_targets():
     # Regression guard: the two scan paths must never share a target list.
     assert main.DEMO_SCAN_TARGET != main.SCAN_TARGETS
     assert main.DEMO_SCAN_TARGET == ["requirements/base.txt"]
-    assert main.DEMO_CVE_PACKAGE == "setuptools"
+    assert main.DEMO_SCAN_TARGET_FALLBACK == ["requirements/development.txt"]
