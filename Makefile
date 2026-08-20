@@ -23,6 +23,7 @@ verify-clean:
 	cp .env /tmp/devin-solution-verify-clean/.env
 	cd /tmp/devin-solution-verify-clean && \
 	  docker compose build --no-cache && \
-	  docker compose up -d && \
+	  PORT=8001 docker compose up -d && \
 	  sleep 10 && \
-	  curl -f -H "Authorization: Bearer $$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)" http://localhost:8000/healthz
+	  (curl -f -H "Authorization: Bearer $$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)" http://localhost:8001/healthz; \
+	   status=$$?; PORT=8001 docker compose down; exit $$status)
