@@ -122,6 +122,64 @@ def test_claim_finding_for_dispatch_is_exclusive(conn):
     assert row["status"] == "dispatching"
 
 
+def test_claim_finding_for_dispatch_records_a_backlog_snapshot(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="f-snap-1", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    assert conn.execute("SELECT COUNT(*) AS n FROM backlog_snapshots").fetchone()["n"] == 0
+
+    store.claim_finding_for_dispatch(conn, finding_id)
+
+    rows = conn.execute("SELECT status, n FROM backlog_snapshots").fetchall()
+    assert any(r["status"] == "dispatching" and r["n"] == 1 for r in rows)
+
+
+def test_claim_finding_for_dispatch_does_not_snapshot_when_claim_fails(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="f-snap-2", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    store.claim_finding_for_dispatch(conn, finding_id)
+    count_after_first_claim = conn.execute("SELECT COUNT(*) AS n FROM backlog_snapshots").fetchone()["n"]
+
+    assert store.claim_finding_for_dispatch(conn, finding_id) is False  # already claimed
+    count_after_second_attempt = conn.execute("SELECT COUNT(*) AS n FROM backlog_snapshots").fetchone()["n"]
+    assert count_after_second_attempt == count_after_first_claim
+
+
+def test_update_finding_status_records_a_backlog_snapshot(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="f-snap-3", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    store.update_finding_status(conn, finding_id, "remediated")
+
+    rows = conn.execute("SELECT status, n FROM backlog_snapshots").fetchall()
+    assert any(r["status"] == "remediated" and r["n"] == 1 for r in rows)
+
+
+def test_record_backlog_snapshot_groups_by_status(conn):
+    # id2 is left at its default 'new' status so a single snapshot (taken when id1
+    # transitions) covers two distinct statuses - confirms GROUP BY status, not just
+    # a single count.
+    id1 = store.insert_finding(
+        conn, fingerprint="f-snap-4", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    store.insert_finding(
+        conn, fingerprint="f-snap-5", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="s",
+    )
+    store.update_finding_status(conn, id1, "remediated")
+
+    latest_taken_at = conn.execute("SELECT MAX(taken_at) AS t FROM backlog_snapshots").fetchone()["t"]
+    rows = conn.execute(
+        "SELECT status, n FROM backlog_snapshots WHERE taken_at = ?", (latest_taken_at,)
+    ).fetchall()
+    assert {r["status"]: r["n"] for r in rows} == {"remediated": 1, "new": 1}
+
+
 def test_start_and_finish_run(conn):
     run_id = store.start_run(conn, "scheduled")
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()

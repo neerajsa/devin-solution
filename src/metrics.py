@@ -1,6 +1,7 @@
 """The six metrics, computed only from structured_output/status/pull_requests[]/acus_consumed/
 CI conclusions/our own timestamps - never parsed from prose. See IMPLEMENTATION_PLAN.md #10."""
 
+import json
 import statistics
 
 # [REVISED 2026-08-17] A real PR is the completion signal now, not a CI-verified
@@ -13,6 +14,28 @@ PR_BACKED_STATES = {"remediated", "partially_remediated"}
 CI_VERIFIED_STATES: set[str] = set()  # kept as a named constant; see first_pass_ci_rate's docstring
 FAILURE_STATES = ["blocked", "no_pr", "needs_human"]
 
+# --- Part 1: cost-estimation heuristic (docs/observability-improvement-proposal.md) ---
+# HEURISTIC ONLY - not real billing data. acus_consumed is confirmed structurally
+# non-functional for this (self-serve, on-demand-credits) account tier - see
+# IMPLEMENTATION_PLAN.md #10 and docs/api-surface.md. RATE_PER_MINUTE is calibrated
+# against the one known real charge ($6.14 for the datetime-fix session); see the
+# proposal doc for the full calibration walkthrough and caveats.
+RATE_PER_MINUTE = 0.071
+MESSAGE_WEIGHT = 0.15
+SCOPE_WEIGHT = 0.05
+FILES_CAP = 10
+FALLBACK_FILES_CHANGED = 1  # neutral single-file assumption when structured_output
+                            # is missing/malformed (a NULL structured_output row does
+                            # not mean nothing happened - see the proposal doc)
+
+# --- Part 2 §4: human-hours-saved baseline (ASSUMED, not measured) ---
+HUMAN_BASELINE_MINUTES_BY_CLASS = {
+    "dependency-cve": 45,   # ASSUMED - triage CVE reachability, bump, verify, open PR
+    "reported-issue": 90,   # ASSUMED - diagnose from a bug report, fix, verify, PR
+}
+DEFAULT_HUMAN_BASELINE_MINUTES = 60
+BASELINE_NOTE = "ASSUMED baseline, not measured - see docs/observability-improvement-proposal.md"
+
 
 def backlog_burndown(conn) -> dict:
     """Current open-vs-resolved snapshot by finding status.
@@ -23,6 +46,16 @@ def backlog_burndown(conn) -> dict:
     """
     rows = conn.execute("SELECT status, COUNT(*) as n FROM findings GROUP BY status").fetchall()
     return {row["status"]: row["n"] for row in rows}
+
+
+def backlog_burndown_series(conn) -> list[dict]:
+    """Time series of the open-vs-resolved backlog. Replaces the snapshot-only
+    backlog_burndown for the dashboard's chart slot; backlog_burndown itself can stay
+    as-is for any caller that only wants the current instantaneous counts."""
+    rows = conn.execute(
+        "SELECT taken_at, status, n FROM backlog_snapshots ORDER BY taken_at"
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def autonomy_rate(conn) -> float | None:
@@ -51,8 +84,23 @@ def first_pass_ci_rate(conn) -> float | None:
     return None
 
 
+def pr_open_rate(conn) -> float | None:
+    """% of terminal sessions that produced a real pr_url. Replaces the permanently-
+    None first_pass_ci_rate (CI verification retired, IMPLEMENTATION_PLAN.md #10/#8.4).
+    Reuses the already-tracked pr_url column - no new instrumentation. Distinct from
+    autonomy_rate: this counts any PR, whether or not a human message was needed."""
+    rows = conn.execute("SELECT pr_url FROM sessions WHERE terminal_at IS NOT NULL").fetchall()
+    if not rows:
+        return None
+    return sum(1 for r in rows if r["pr_url"]) / len(rows)
+
+
 def latency_percentiles(conn) -> dict:
-    """Dispatch to final terminal state, in seconds (p50/p95).
+    """Dispatch to final terminal state, in seconds (p50/p95), plus an estimated
+    human-hours-saved figure against an explicitly ASSUMED per-class baseline
+    (docs/observability-improvement-proposal.md Part 2 #4 - IMPLEMENTATION_PLAN.md
+    #10 names the "compare against a stated human baseline" framing but never states
+    an actual number, so one is introduced here as a labeled assumption, not fact).
 
     Uses sessions.created_at -> terminal_at, which is dispatch-to-final-
     outcome, not specifically dispatch-to-PR-opened (we don't persist that
@@ -60,16 +108,30 @@ def latency_percentiles(conn) -> dict:
     precision the schema doesn't have.
     """
     rows = conn.execute(
-        "SELECT created_at, terminal_at FROM sessions WHERE terminal_at IS NOT NULL"
+        """SELECT s.created_at, s.terminal_at, f.class AS finding_class
+           FROM sessions s JOIN findings f ON f.id = s.finding_id
+           WHERE s.terminal_at IS NOT NULL"""
     ).fetchall()
     durations = [r["terminal_at"] - r["created_at"] for r in rows]
+    hours_saved = 0.0
+    for r in rows:
+        baseline_minutes = HUMAN_BASELINE_MINUTES_BY_CLASS.get(
+            r["finding_class"], DEFAULT_HUMAN_BASELINE_MINUTES
+        )
+        duration_minutes = (r["terminal_at"] - r["created_at"]) / 60
+        hours_saved += max(0, baseline_minutes - duration_minutes) / 60
     if not durations:
-        return {"p50_seconds": None, "p95_seconds": None, "n": 0}
+        return {
+            "p50_seconds": None, "p95_seconds": None, "n": 0,
+            "est_human_hours_saved": 0.0, "baseline_note": BASELINE_NOTE,
+        }
     durations.sort()
     return {
         "p50_seconds": statistics.median(durations),
         "p95_seconds": durations[min(len(durations) - 1, int(len(durations) * 0.95))],
         "n": len(durations),
+        "est_human_hours_saved": hours_saved,
+        "baseline_note": BASELINE_NOTE,
     }
 
 
@@ -95,6 +157,53 @@ def cost_per_merged_fix(conn) -> dict:
     }
 
 
+def estimate_session_cost_usd(session_row) -> float | None:
+    """HEURISTIC estimate only - not real billing data. acus_consumed is confirmed
+    non-functional for this (self-serve) account, so this is a duration-plus-
+    signal heuristic calibrated against one known $6.14 charge, not a measured
+    cost. Returns None for non-terminal sessions (nothing to estimate yet)."""
+    if session_row["terminal_at"] is None:
+        return None
+    duration_minutes = (session_row["terminal_at"] - session_row["created_at"]) / 60
+    human_messages = session_row["human_messages_sent"] or 0
+
+    files_changed = FALLBACK_FILES_CHANGED
+    raw = session_row["structured_output"]
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            fc = parsed.get("files_changed")
+            if isinstance(fc, list):
+                files_changed = len(fc)
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass  # keep fallback
+
+    message_factor = 1 + MESSAGE_WEIGHT * human_messages
+    scope_factor = 1 + SCOPE_WEIGHT * min(files_changed, FILES_CAP)
+    return RATE_PER_MINUTE * duration_minutes * message_factor * scope_factor
+
+
+def estimated_cost_per_merged_fix(conn) -> dict:
+    """Replaces the ACU-based cost_per_merged_fix. Sums the per-session heuristic
+    estimate over PR-backed sessions (remediated/partially_remediated - the same
+    PR-is-completion definition dispatch() uses elsewhere) and divides by count.
+    Every key is prefixed/labeled to make clear this is estimated, not measured."""
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE state IN ({})".format(
+            ",".join("?" * len(PR_BACKED_STATES))
+        ),
+        list(PR_BACKED_STATES),
+    ).fetchall()
+    estimates = [e for r in rows if (e := estimate_session_cost_usd(r)) is not None]
+    total = sum(estimates)
+    return {
+        "merged_fix_count": len(rows),
+        "estimated_total_usd": round(total, 2),
+        "estimated_usd_per_merged_fix": round(total / len(estimates), 2) if estimates else None,
+        "is_heuristic": True,  # dashboard.html branches on this to force the disclaimer
+    }
+
+
 def failure_taxonomy(conn) -> dict:
     """Counts of each failure-ish outcome. Tracked honestly, not hidden - a system that never
     shows a failure is less credible than one that does."""
@@ -110,11 +219,17 @@ def failure_taxonomy(conn) -> dict:
 
 
 def all_metrics(conn) -> dict:
+    """5 stat cards + 1 chart = six metrics (docs/observability-improvement-proposal.md
+    Part 2). autonomy_rate/latency/failure_taxonomy are unchanged; pr_open_rate and
+    estimated_cost_per_merged_fix replace the two broken metrics (first_pass_ci_rate/
+    cost_per_merged_fix - kept as functions for history, no longer surfaced here);
+    backlog_burndown_series replaces the snapshot-only backlog_burndown in the
+    dedicated chart slot."""
     return {
-        "backlog_burndown": backlog_burndown(conn),
         "autonomy_rate": autonomy_rate(conn),
-        "first_pass_ci_rate": first_pass_ci_rate(conn),
+        "pr_open_rate": pr_open_rate(conn),
         "latency": latency_percentiles(conn),
-        "cost_per_merged_fix": cost_per_merged_fix(conn),
+        "estimated_cost_per_merged_fix": estimated_cost_per_merged_fix(conn),
         "failure_taxonomy": failure_taxonomy(conn),
+        "backlog_burndown_series": backlog_burndown_series(conn),
     }

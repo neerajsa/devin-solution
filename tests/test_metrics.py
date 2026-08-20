@@ -57,3 +57,161 @@ def test_cost_per_merged_fix_counts_pr_backed_states_only(conn):
 
     result = metrics.cost_per_merged_fix(conn)
     assert result["merged_fix_count"] == 2
+
+
+# --- pr_open_rate ---
+
+def _add_session_with_pr(conn, *, state: str, pr_url: str | None, terminal: bool = True):
+    fid = store.insert_finding(
+        conn, fingerprint=f"f-{state}-{pr_url}-{terminal}", source="pip-audit",
+        finding_class="dependency-cve", severity="unrated", summary="s",
+    )
+    store.upsert_session(
+        conn, session_id=None, finding_id=fid, devin_session_id="d", devin_url="u",
+        state=state, pr_url=pr_url, terminal=terminal,
+    )
+
+
+def test_pr_open_rate_counts_any_pr_on_terminal_sessions(conn):
+    _add_session_with_pr(conn, state="remediated", pr_url="https://github.com/x/y/pull/1")
+    _add_session_with_pr(conn, state="not_applicable", pr_url=None)
+    _add_session_with_pr(conn, state="needs_human", pr_url=None)
+
+    assert metrics.pr_open_rate(conn) == pytest.approx(1 / 3)
+
+
+def test_pr_open_rate_ignores_non_terminal_sessions(conn):
+    _add_session_with_pr(conn, state="working", pr_url=None, terminal=False)
+    assert metrics.pr_open_rate(conn) is None
+
+
+def test_pr_open_rate_is_none_with_no_terminal_sessions(conn):
+    assert metrics.pr_open_rate(conn) is None
+
+
+# --- estimate_session_cost_usd / estimated_cost_per_merged_fix ---
+
+def _session_row(conn, *, state="remediated", duration_seconds=60.0,
+                  human_messages_sent=0, structured_output=None, terminal=True,
+                  pr_url="https://github.com/x/y/pull/1"):
+    fid = store.insert_finding(
+        conn, fingerprint=f"f-{state}-{duration_seconds}-{human_messages_sent}",
+        source="pip-audit", finding_class="dependency-cve", severity="unrated", summary="s",
+    )
+    session_id = store.upsert_session(
+        conn, session_id=None, finding_id=fid, devin_session_id="d", devin_url="u",
+        state=state, pr_url=pr_url, human_messages_sent=human_messages_sent,
+        structured_output=structured_output, terminal=terminal,
+    )
+    row = store.get_session(conn, session_id)
+    if terminal:
+        # Force an exact, known duration rather than relying on wall-clock timing -
+        # created_at/terminal_at are both set to time.time() by store.upsert_session.
+        conn.execute(
+            "UPDATE sessions SET created_at = 0, terminal_at = ? WHERE id = ?",
+            (duration_seconds, session_id),
+        )
+        conn.commit()
+        row = store.get_session(conn, session_id)
+    return row
+
+
+def test_estimate_session_cost_usd_is_none_for_non_terminal_session(conn):
+    row = _session_row(conn, terminal=False)
+    assert metrics.estimate_session_cost_usd(row) is None
+
+
+def test_estimate_session_cost_usd_neutral_case_matches_rate_times_duration(conn):
+    # No human messages -> message_factor is exactly 1.0. No structured_output ->
+    # files_changed falls back to FALLBACK_FILES_CHANGED (1), which still applies a
+    # small (+5%) scope factor, not a bypass of it - this is the proposal doc's own
+    # datetime-fix calibration case (86.3 min, ~$6.43 with the fallback's scope
+    # factor applied, close to the ~$6.14 real charge it was calibrated against).
+    row = _session_row(conn, duration_seconds=86.3 * 60, human_messages_sent=0,
+                        structured_output=None)
+    estimate = metrics.estimate_session_cost_usd(row)
+    expected = metrics.RATE_PER_MINUTE * 86.3 * 1.0 * (1 + metrics.SCOPE_WEIGHT * metrics.FALLBACK_FILES_CHANGED)
+    assert estimate == pytest.approx(expected, abs=0.001)
+
+
+def test_estimate_session_cost_usd_uses_files_changed_from_structured_output(conn):
+    row = _session_row(conn, duration_seconds=600, human_messages_sent=0,
+                        structured_output={"files_changed": ["a.py", "b.py"]})
+    estimate = metrics.estimate_session_cost_usd(row)
+    expected = metrics.RATE_PER_MINUTE * 10 * 1.0 * (1 + metrics.SCOPE_WEIGHT * 2)
+    assert estimate == pytest.approx(expected)
+
+
+def test_estimate_session_cost_usd_applies_message_weight(conn):
+    row = _session_row(conn, duration_seconds=600, human_messages_sent=2,
+                        structured_output=None)
+    estimate = metrics.estimate_session_cost_usd(row)
+    # files_changed falls back to 1 (neutral) since structured_output is missing.
+    expected = metrics.RATE_PER_MINUTE * 10 * (1 + metrics.MESSAGE_WEIGHT * 2) * (1 + metrics.SCOPE_WEIGHT * 1)
+    assert estimate == pytest.approx(expected)
+
+
+def test_estimate_session_cost_usd_caps_files_scope_factor(conn):
+    row = _session_row(conn, duration_seconds=600, human_messages_sent=0,
+                        structured_output={"files_changed": [f"f{i}.py" for i in range(50)]})
+    estimate = metrics.estimate_session_cost_usd(row)
+    expected = metrics.RATE_PER_MINUTE * 10 * 1.0 * (1 + metrics.SCOPE_WEIGHT * metrics.FILES_CAP)
+    assert estimate == pytest.approx(expected)
+
+
+def test_estimated_cost_per_merged_fix_only_sums_pr_backed_states(conn):
+    _session_row(conn, state="remediated", duration_seconds=600, pr_url="https://github.com/x/y/pull/1")
+    _session_row(conn, state="partially_remediated", duration_seconds=300, pr_url="https://github.com/x/y/pull/2")
+    _session_row(conn, state="not_applicable", duration_seconds=100, pr_url=None)  # not PR-backed
+
+    result = metrics.estimated_cost_per_merged_fix(conn)
+    assert result["merged_fix_count"] == 2
+    assert result["is_heuristic"] is True
+    assert result["estimated_usd_per_merged_fix"] is not None
+    assert result["estimated_total_usd"] > 0
+
+
+def test_estimated_cost_per_merged_fix_none_when_no_pr_backed_sessions(conn):
+    _session_row(conn, state="not_applicable", duration_seconds=100, pr_url=None)
+    result = metrics.estimated_cost_per_merged_fix(conn)
+    assert result["merged_fix_count"] == 0
+    assert result["estimated_usd_per_merged_fix"] is None
+    assert result["estimated_total_usd"] == 0
+
+
+# --- latency_percentiles human-hours-saved enrichment ---
+
+def test_latency_percentiles_computes_human_hours_saved_against_class_baseline(conn):
+    # dependency-cve baseline is 45 min; a 15-min session saves 30 min = 0.5h.
+    _session_row(conn, state="remediated", duration_seconds=15 * 60)
+    result = metrics.latency_percentiles(conn)
+    assert result["est_human_hours_saved"] == pytest.approx(0.5)
+    assert "ASSUMED" in result["baseline_note"]
+
+
+def test_latency_percentiles_hours_saved_floors_at_zero_when_slower_than_baseline(conn):
+    # A session that took longer than the baseline shouldn't produce negative savings.
+    _session_row(conn, state="remediated", duration_seconds=200 * 60)
+    result = metrics.latency_percentiles(conn)
+    assert result["est_human_hours_saved"] == 0.0
+
+
+# --- backlog_burndown_series ---
+
+def test_backlog_burndown_series_empty_with_no_snapshots(conn):
+    assert metrics.backlog_burndown_series(conn) == []
+
+
+def test_backlog_burndown_series_reflects_recorded_snapshots(conn):
+    fid = store.insert_finding(
+        conn, fingerprint="f-burndown", source="pip-audit",
+        finding_class="dependency-cve", severity="unrated", summary="s",
+    )
+    store.claim_finding_for_dispatch(conn, fid)  # 'new' -> 'dispatching', records a snapshot
+    store.update_finding_status(conn, fid, "remediated")  # records another snapshot
+
+    series = metrics.backlog_burndown_series(conn)
+    statuses_seen = {row["status"] for row in series}
+    assert "dispatching" in statuses_seen
+    assert "remediated" in statuses_seen
+    assert all({"taken_at", "status", "n"} <= row.keys() for row in series)

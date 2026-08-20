@@ -4,14 +4,25 @@
   <meta charset="utf-8">
   <title>Devin Remediation Pipeline</title>
   <style>
-    body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
-    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
+    body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; }
     .card .label { font-size: 0.85rem; color: #666; }
     .card .value { font-size: 1.6rem; font-weight: 600; }
+    .card .sub { font-size: 0.85rem; color: #444; margin-top: 0.25rem; }
+    .caveat { font-size: 0.75rem; color: #888; font-style: italic; margin-top: 0.35rem; }
+    .chart-section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 2rem; }
+    .chart-section .label { font-size: 0.85rem; color: #666; margin-bottom: 0.5rem; }
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.5rem; font-size: 0.8rem; color: #444; }
+    .legend-item { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+    .muted { color: #999; }
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
     .seeded { color: #b45309; }
+    .cont-cell { color: #bbb; }
+    .desc-cell { max-width: 320px; }
+    .na { color: #aaa; }
   </style>
 </head>
 <body>
@@ -23,8 +34,8 @@
       <div class="value">{{ "%.0f%%"|format(m.autonomy_rate * 100) if m.autonomy_rate is not none else "n/a" }}</div>
     </div>
     <div class="card">
-      <div class="label">First-pass CI rate</div>
-      <div class="value">{{ "%.0f%%"|format(m.first_pass_ci_rate * 100) if m.first_pass_ci_rate is not none else "n/a" }}</div>
+      <div class="label">PR-open rate</div>
+      <div class="value">{{ "%.0f%%"|format(m.pr_open_rate * 100) if m.pr_open_rate is not none else "n/a" }}</div>
     </div>
     <div class="card">
       <div class="label">Latency (p50 / p95)</div>
@@ -32,14 +43,15 @@
         {{ "%.0fs"|format(m.latency.p50_seconds) if m.latency.p50_seconds is not none else "n/a" }} /
         {{ "%.0fs"|format(m.latency.p95_seconds) if m.latency.p95_seconds is not none else "n/a" }}
       </div>
+      <div class="sub">~{{ "%.1f"|format(m.latency.est_human_hours_saved) }}h saved vs. assumed baseline</div>
+      <div class="caveat">{{ m.latency.baseline_note }}</div>
     </div>
     <div class="card">
-      <div class="label">ACU per merged fix</div>
-      <div class="value">{{ "%.1f"|format(m.cost_per_merged_fix.acu_per_merged_fix) if m.cost_per_merged_fix.acu_per_merged_fix is not none else "n/a" }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Backlog by status</div>
-      <div class="value">{% for status, n in m.backlog_burndown.items() %}{{ status }}: {{ n }}&nbsp; {% endfor %}</div>
+      <div class="label">Est. cost per merged fix</div>
+      <div class="value">
+        {{ "$%.2f"|format(m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix) if m.estimated_cost_per_merged_fix.estimated_usd_per_merged_fix is not none else "n/a" }}
+      </div>
+      <div class="caveat">heuristic estimate, not real billing data - see docs/observability-improvement-proposal.md</div>
     </div>
     <div class="card">
       <div class="label">Failure taxonomy</div>
@@ -47,17 +59,29 @@
     </div>
   </div>
 
+  <div class="chart-section">
+    <div class="label">Backlog burndown (findings by status, over time)</div>
+    {{ backlog_chart_svg | safe }}
+  </div>
+
   <h2>Findings</h2>
   <table>
-    <tr><th>Fingerprint</th><th>Class</th><th>Package</th><th>Severity</th><th>Status</th><th>Issue</th></tr>
+    <tr>
+      <th>Fingerprint</th><th>Class</th><th>Package</th><th>Severity</th><th>Status</th>
+      <th>Issue</th><th>Description</th><th>Session</th><th>Devin session</th><th>PR</th>
+    </tr>
     {% for f in findings %}
-    <tr class="{{ 'seeded' if f.seeded else '' }}">
-      <td>{{ f.fingerprint }}</td>
-      <td>{{ f['class'] }}</td>
-      <td>{{ f.package or '' }}</td>
-      <td>{{ f.severity }}</td>
-      <td>{{ f.status }}</td>
-      <td>{% if f.issue_url %}<a href="{{ f.issue_url }}">#{{ f.issue_number }}</a>{% endif %}</td>
+    <tr class="{{ 'seeded' if f.seeded and not f.is_continuation else '' }}">
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.fingerprint }}</td>
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f['class'] }}</td>
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.package or '' }}</td>
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.severity }}</td>
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{{ f.status }}</td>
+      <td class="{{ 'cont-cell' if f.is_continuation else '' }}">{% if f.issue_url %}<a href="{{ f.issue_url }}">#{{ f.issue_number }}</a>{% endif %}</td>
+      <td class="desc-cell {{ 'cont-cell' if f.is_continuation else '' }}" title="{{ f.summary_full }}">{{ f.summary_short }}</td>
+      <td>{% if not f.session_id %}<span class="na">n/a</span>{% else %}{{ f.session_state }}{% endif %}</td>
+      <td>{% if f.session_devin_url %}<a href="{{ f.session_devin_url }}">session</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
+      <td>{% if f.session_pr_url %}<a href="{{ f.session_pr_url }}">PR</a>{% else %}<span class="na">&mdash;</span>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
