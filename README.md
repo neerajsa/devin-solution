@@ -74,7 +74,7 @@ make verify-clean
 | `make demo-issue` | File a real, `devin-autofix`-labeled GitHub issue for a fast live walkthrough (see [Demo and evidence](#demo-and-evidence)). |
 | `make demo-scan` | Trigger a fast, single-CVE scan of `requirements/base.txt` only. |
 | `make verify-clean` | Fresh clone, full rebuild, healthcheck. |
-| `GET /dashboard?token=<WEBHOOK_SECRET>` | Live observability: autonomy rate, PR-open rate, latency, cost estimate, failure taxonomy, backlog burndown. |
+| `make dashboard` | Print and open the live dashboard: autonomy rate, PR-open rate, latency, cost estimate, failure taxonomy, backlog burndown. |
 
 To enable the human-reported-bug trigger path, register a real webhook once `make tunnel` is running:
 

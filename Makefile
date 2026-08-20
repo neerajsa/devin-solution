@@ -1,8 +1,14 @@
-.PHONY: up test verify-clean tunnel scan demo-issue demo-scan
+.PHONY: up test verify-clean tunnel scan dashboard demo-issue demo-scan
 
 up:           ; docker compose up --build
 test:         ; python -m pytest tests/
 tunnel:       ; cloudflared tunnel --url http://localhost:8000
+
+# Prints the dashboard URL (with token) and opens it in a browser if possible.
+dashboard:
+	@URL="http://localhost:8000/dashboard?token=$$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)"; \
+	echo "$$URL"; \
+	(command -v open >/dev/null && open "$$URL") || (command -v xdg-open >/dev/null && xdg-open "$$URL") || true
 
 # Production scan: all of requirements/base.txt + requirements/development.txt.
 scan:
