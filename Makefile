@@ -1,8 +1,13 @@
-.PHONY: up test verify-clean tunnel demo-issue demo-scan
+.PHONY: up test verify-clean tunnel scan demo-issue demo-scan
 
 up:           ; docker compose up --build
 test:         ; python -m pytest tests/
 tunnel:       ; cloudflared tunnel --url http://localhost:8000
+
+# Production scan: all of requirements/base.txt + requirements/development.txt.
+scan:
+	curl -f -X POST http://localhost:8000/scan/run \
+	  -H "Authorization: Bearer $$(grep '^WEBHOOK_SECRET=' .env | cut -d'=' -f2)"
 
 # Demo entry points - fast, cheap, deterministic. Target whatever instance is
 # currently up per its own .env, same as every other target here. Requires
