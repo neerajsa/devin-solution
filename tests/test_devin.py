@@ -39,6 +39,16 @@ async def test_create_session_posts_to_org_scoped_path_with_bearer_auth():
     assert result["session_id"] == "s1"
 
 
+def test_client_uses_an_explicit_timeout_not_httpx_default():
+    # Real incident, 2026-08-19: httpx's own 5s default (connect/read/write/
+    # pool each) was too tight for polling a busy agentic session and caused
+    # a real ReadTimeout that orphaned a healthy session. Must be overridden,
+    # not inherited.
+    client = devin.DevinClient(api_key="cog_test", org_id=ORG_ID)
+    assert client._client.timeout.read == devin.REQUEST_TIMEOUT_SECONDS
+    assert client._client.timeout.read > httpx.Timeout(5.0).read
+
+
 @pytest.mark.asyncio
 async def test_get_session_returns_parsed_json():
     def handler(request: httpx.Request) -> httpx.Response:

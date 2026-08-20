@@ -24,6 +24,8 @@ import asyncio
 import logging
 import time
 
+import httpx
+
 import prompts
 import store
 from devin import DevinClient
@@ -157,7 +159,26 @@ class Orchestrator:
         human_messages_sent = 0
 
         while True:
-            raw = await self._devin.get_session(devin_session_id)
+            try:
+                raw = await self._devin.get_session(devin_session_id)
+            except httpx.TransportError:
+                # A transient network error carries zero information about the
+                # session's real state - it isn't "working" and it isn't
+                # terminal, it's just "we don't know right now." That's the
+                # same epistemic position as the "working" branch below, which
+                # already retries forever with no cap because there's no
+                # principled cutoff for "how long is too long to still be
+                # working." A capped retry count here would just be a second,
+                # arbitrary policy for the same situation - and real incident
+                # 2026-08-19 showed exactly why giving up early is the wrong
+                # trade: a single httpx.ReadTimeout mid-poll orphaned a
+                # healthy, already-running flask session for hours. A real,
+                # non-transient failure (DevinAPIError - 401/404/500) is
+                # informative and still propagates immediately, unchanged.
+                logger.warning("transient network error polling session %s - retrying", devin_session_id)
+                await asyncio.sleep(self._poll_interval)
+                continue
+
             state, pr_url = resolve(raw)
 
             if state == "working":
@@ -215,5 +236,13 @@ class Orchestrator:
             human_messages_sent=human_messages_sent, structured_output=structured_output,
             acu_used=acu_used, terminal=True,
         )
-        await self._devin.terminate_session(devin_session_id, archive=True)
+        try:
+            await self._devin.terminate_session(devin_session_id, archive=True)
+        except Exception:
+            # The real, correct outcome is already durably recorded above - a
+            # termination failure just leaves the session idle a bit longer
+            # (small cost), never a reason to lose the outcome we already have.
+            # Same "don't let a non-essential side effect block a real result"
+            # rule dispatch() already applies to trigger_pr_review failures.
+            logger.exception("failed to terminate session %s", devin_session_id)
         return {"session_id": session_id, "devin_session_id": devin_session_id, "state": state, "pr_url": pr_url}

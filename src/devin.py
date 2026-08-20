@@ -4,6 +4,13 @@ import httpx
 
 BASE_URL = "https://api.devin.ai"
 
+# httpx's own default (5s for connect/read/write/pool each) is aggressive for
+# polling a real, busy agentic session - the API can legitimately take a
+# moment to respond while a session is mid-work. Real incident 2026-08-19: a
+# GET /sessions/{id} call hit httpx's default read timeout, which orchestrator.py
+# treated as fatal and orphaned an otherwise-healthy, already-running session.
+REQUEST_TIMEOUT_SECONDS = 30.0
+
 
 class DevinAPIError(Exception):
     def __init__(self, status_code: int, body: str):
@@ -20,6 +27,7 @@ class DevinClient:
             base_url=BASE_URL,
             headers={"Authorization": f"Bearer {api_key}"},
             transport=transport,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
     async def create_session(self, *, prompt: str, title: str, tags: list[str],

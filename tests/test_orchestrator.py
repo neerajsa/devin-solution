@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -250,3 +251,101 @@ async def test_dispatch_failure_after_session_created_does_not_raise_not_started
     # so a caller can't mistake this for the pre-session case above.
     assert not isinstance(exc_info.value, orchestrator.DispatchNotStartedError)
     assert fake.created is not None  # create_session did succeed before the failure
+
+
+# --- Transient poll-failure resilience (real incident, 2026-08-19: an
+# httpx.ReadTimeout mid-poll orphaned a healthy, already-running flask
+# session - the loop gave up on a real session for a one-off network blip) ---
+
+@pytest.mark.asyncio
+async def test_poll_retries_a_transient_network_error_then_succeeds(conn):
+    class FlakyThenFineDevinClient(FakeDevinClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._get_calls = 0
+
+        async def get_session(self, session_id):
+            self._get_calls += 1
+            if self._get_calls == 1:
+                raise httpx.ReadTimeout("simulated blip")
+            return {"status": "running", "status_detail": "working",
+                    "structured_output": {"status": "not_applicable"}, "pull_requests": []}
+
+    fake = FlakyThenFineDevinClient([{}])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
+
+    assert result["state"] == "not_applicable"
+    assert fake.terminated == [("devin-1", True)]
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_transient_failures_with_no_cap(conn):
+    # Deliberately uncapped: a transient network error carries no information
+    # about the session's real state, exactly like "still working" - there is
+    # no principled attempt count at which retrying stops being correct. Many
+    # consecutive failures must still recover, not just one.
+    class VeryFlakyThenFineDevinClient(FakeDevinClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._get_calls = 0
+
+        async def get_session(self, session_id):
+            self._get_calls += 1
+            if self._get_calls <= 20:
+                raise httpx.ReadTimeout("simulated extended blip")
+            return {"status": "running", "status_detail": "working",
+                    "structured_output": {"status": "not_applicable"}, "pull_requests": []}
+
+    fake = VeryFlakyThenFineDevinClient([{}])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
+
+    assert result["state"] == "not_applicable"
+    assert fake.terminated == [("devin-1", True)]
+
+
+@pytest.mark.asyncio
+async def test_poll_still_propagates_a_real_non_transient_api_error(conn):
+    # A genuine DevinAPIError (401/404/500 - not httpx.TransportError) is
+    # informative and must still fail fast, unlike a network blip.
+    from devin import DevinAPIError
+
+    class BrokenSessionDevinClient(FakeDevinClient):
+        async def get_session(self, session_id):
+            raise DevinAPIError(404, "session not found")
+
+    fake = BrokenSessionDevinClient([{}])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    with pytest.raises(DevinAPIError):
+        await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
+
+    assert fake.terminated == []
+
+
+@pytest.mark.asyncio
+async def test_terminate_failure_does_not_block_recording_the_outcome(conn):
+    class FailsToTerminateDevinClient(FakeDevinClient):
+        async def terminate_session(self, session_id, *, archive=True):
+            raise RuntimeError("boom")
+
+    fake = FailsToTerminateDevinClient([
+        {"status": "running", "status_detail": "working",
+         "structured_output": {"status": "not_applicable"}, "pull_requests": []},
+    ])
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0)
+
+    finding = _cve_finding()
+    result = await orch.dispatch(finding, run_id="run-1", issue_number=7)
+
+    # The real outcome is still fully recorded, on both the session and the
+    # finding, even though the non-essential termination call failed.
+    assert result["state"] == "not_applicable"
+    row = store.get_session(conn, result["session_id"])
+    assert row["state"] == "not_applicable"
+    assert row["terminal_at"] is not None
+    finding_row = store.get_finding_by_fingerprint(conn, finding.fingerprint)
+    assert finding_row["status"] == "not_applicable"
