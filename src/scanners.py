@@ -29,7 +29,7 @@ class Finding:
     file_path: str | None = None
 
 
-def _severity_from_aliases(aliases: list[str], client: httpx.Client) -> str:
+async def _severity_from_aliases(aliases: list[str], client: httpx.AsyncClient) -> str:
     """Resolve severity via a GHSA alias's database_specific.severity. 'unrated' on any failure.
 
     pip-audit's own JSON never includes a severity field, so this is a
@@ -40,15 +40,17 @@ def _severity_from_aliases(aliases: list[str], client: httpx.Client) -> str:
     if not ghsa_id:
         return "unrated"
     try:
-        resp = client.get(f"{OSV_API}/{ghsa_id}", timeout=10)
+        resp = await client.get(f"{OSV_API}/{ghsa_id}", timeout=10)
         resp.raise_for_status()
-        severity = resp.json().get("database_specific", {}).get("severity")
-        return severity.lower() if severity else "unrated"
+        data = resp.json()
     except (httpx.HTTPError, ValueError):
         return "unrated"
+    database_specific = data.get("database_specific") if isinstance(data, dict) else None
+    severity = database_specific.get("severity") if isinstance(database_specific, dict) else None
+    return severity.lower() if isinstance(severity, str) and severity else "unrated"
 
 
-def parse_pip_audit(raw: dict, *, client: httpx.Client | None = None) -> list[Finding]:
+async def parse_pip_audit(raw: dict, *, client: httpx.AsyncClient | None = None) -> list[Finding]:
     """Normalize `pip-audit --no-deps --format json` output.
 
     Dedupes on (package, version, vuln_id) - pip-audit really does return
@@ -67,9 +69,11 @@ def parse_pip_audit(raw: dict, *, client: httpx.Client | None = None) -> list[Fi
     generalizes to it naturally by joining one sorted id instead of several -
     so already-issued findings (setuptools, flask, paramiko, cryptography)
     keep matching their real GitHub issue fingerprint markers.
+
+    OSV severity lookups for every vuln across every group run concurrently.
     """
     owns_client = client is None
-    client = client or httpx.Client()
+    client = client or httpx.AsyncClient()
     try:
         seen: set[tuple[str, str, str]] = set()
         grouped: dict[tuple[str, str], list[dict]] = {}
@@ -83,16 +87,22 @@ def parse_pip_audit(raw: dict, *, client: httpx.Client | None = None) -> list[Fi
                 seen.add(key)
                 grouped.setdefault((package, version), []).append(vuln)
 
+        all_vulns = [v for vulns in grouped.values() for v in vulns]
+        severities = await asyncio.gather(
+            *(_severity_from_aliases(v.get("aliases", []), client) for v in all_vulns)
+        )
+        severity_by_vuln = {id(v): sev for v, sev in zip(all_vulns, severities)}
+
         return [
-            _finding_for_group(package, version, vulns, client)
+            _finding_for_group(package, version, vulns, [severity_by_vuln[id(v)] for v in vulns])
             for (package, version), vulns in grouped.items()
         ]
     finally:
         if owns_client:
-            client.close()
+            await client.aclose()
 
 
-def _finding_for_group(package: str, version: str, vulns: list[dict], client: httpx.Client) -> Finding:
+def _finding_for_group(package: str, version: str, vulns: list[dict], severities: list[str]) -> Finding:
     vuln_ids = sorted(v["id"] for v in vulns)
     fingerprint = f"{'+'.join(id_.lower() for id_ in vuln_ids)}:{package.lower()}"
 
@@ -107,10 +117,7 @@ def _finding_for_group(package: str, version: str, vulns: list[dict], client: ht
         current_version=version,
         fixed_version=_combined_fixed_version(vulns),
         cve_id=", ".join(cve_ids) if cve_ids else None,
-        severity=max(
-            (_severity_from_aliases(v.get("aliases", []), client) for v in vulns),
-            key=lambda s: SEVERITY_RANK.get(s, 0),
-        ),
+        severity=max(severities, key=lambda s: SEVERITY_RANK.get(s, 0)),
         summary="\n\n".join(f"{v['id']}: {v.get('description', '')[:500]}" for v in vulns),
     )
 
@@ -148,39 +155,35 @@ async def fetch_and_scan(repo: str, branch: str, paths: list[str], *,
     requirement" when run outside the repo tree).
     """
     findings = []
-    sync_client = httpx.Client()
-    try:
-        for path in paths:
-            url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-            resp = await client.get(url, timeout=15)
-            resp.raise_for_status()
-            text = "\n".join(
-                line for line in resp.text.splitlines() if not line.startswith("-e ")
+    for path in paths:
+        url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+        resp = await client.get(url, timeout=15)
+        resp.raise_for_status()
+        text = "\n".join(
+            line for line in resp.text.splitlines() if not line.startswith("-e ")
+        )
+
+        fd, tmp_path = tempfile.mkstemp(suffix=".txt")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            # Invoked as `sys.executable -m pip_audit`, not a bare "pip-audit" PATH
+            # lookup - the latter can silently resolve to a different interpreter's
+            # install (confirmed live: it found a pip-audit bound to a stray Python
+            # 3.14, immediately hitting the exact backports-zstd wheel-gap failure
+            # this whole 3.11 requirement exists to avoid). sys.executable guarantees
+            # the same interpreter this module is already running under.
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip_audit", "--no-deps", "-r", tmp_path,
+                "--format", "json",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
+            stdout, _stderr = await proc.communicate()
+            # pip-audit exits 1 when it finds vulnerabilities - that's expected,
+            # not a failure. Only an unparseable stdout means something's wrong.
+            raw = json.loads(stdout)
+        finally:
+            os.unlink(tmp_path)
 
-            fd, tmp_path = tempfile.mkstemp(suffix=".txt")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    f.write(text)
-                # Invoked as `sys.executable -m pip_audit`, not a bare "pip-audit" PATH
-                # lookup - the latter can silently resolve to a different interpreter's
-                # install (confirmed live: it found a pip-audit bound to a stray Python
-                # 3.14, immediately hitting the exact backports-zstd wheel-gap failure
-                # this whole 3.11 requirement exists to avoid). sys.executable guarantees
-                # the same interpreter this module is already running under.
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-m", "pip_audit", "--no-deps", "-r", tmp_path,
-                    "--format", "json",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _stderr = await proc.communicate()
-                # pip-audit exits 1 when it finds vulnerabilities - that's expected,
-                # not a failure. Only an unparseable stdout means something's wrong.
-                raw = json.loads(stdout)
-            finally:
-                os.unlink(tmp_path)
-
-            findings.extend(parse_pip_audit(raw, client=sync_client))
-        return findings
-    finally:
-        sync_client.close()
+        findings.extend(await parse_pip_audit(raw, client=client))
+    return findings
