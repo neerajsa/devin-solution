@@ -58,13 +58,26 @@ CREATE TABLE IF NOT EXISTS deliveries (
 """
 
 
+BUSY_TIMEOUT_MS = 5000
+
+
 def connect(path: str) -> sqlite3.Connection:
     # FastAPI runs sync `def` routes (e.g. the dashboard) in a threadpool
     # worker thread, separate from the event-loop thread this connection is
     # created on - check_same_thread=False allows that cross-thread reuse.
-    # Our own usage is never concurrent enough to need more than this.
-    conn = sqlite3.connect(path, check_same_thread=False)
+    #
+    # isolation_level=None (autocommit): every write helper below is a single
+    # atomic statement, so there's no need for the sqlite3 module's implicit
+    # BEGIN/COMMIT bookkeeping - which isn't safe when one connection is used
+    # from several threads at once ("cannot start a transaction within a
+    # transaction"). WAL lets readers and the writer proceed concurrently, and
+    # busy_timeout makes writers from other connections wait for the write
+    # lock instead of failing immediately with "database is locked".
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None,
+                           timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
     return conn
 
@@ -75,22 +88,21 @@ def insert_finding(conn: sqlite3.Connection, *, fingerprint: str, source: str,
                     fixed_version: str | None = None, cve_id: str | None = None,
                     file_path: str | None = None, seeded: bool = False) -> str:
     """Insert a finding, or return the existing id if this fingerprint was already seen."""
-    existing = get_finding_by_fingerprint(conn, fingerprint)
-    if existing:
-        return existing["id"]
-
-    finding_id = str(uuid.uuid4())
     now = time.time()
+    # A single INSERT ... ON CONFLICT is atomic, unlike a SELECT-then-INSERT,
+    # which lets two concurrent writers both miss and then collide on the
+    # UNIQUE fingerprint.
     conn.execute(
         """INSERT INTO findings
            (id, fingerprint, source, class, package, current_version, fixed_version,
             cve_id, severity, file_path, summary, seeded, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)""",
-        (finding_id, fingerprint, source, finding_class, package, current_version,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+           ON CONFLICT(fingerprint) DO NOTHING""",
+        (str(uuid.uuid4()), fingerprint, source, finding_class, package, current_version,
          fixed_version, cve_id, severity, file_path, summary, int(seeded), now, now),
     )
     conn.commit()
-    return finding_id
+    return get_finding_by_fingerprint(conn, fingerprint)["id"]
 
 
 def get_finding_by_fingerprint(conn: sqlite3.Connection, fingerprint: str) -> sqlite3.Row | None:
