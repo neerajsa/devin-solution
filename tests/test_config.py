@@ -75,3 +75,12 @@ def test_session_timeout_is_overridable(monkeypatch):
     monkeypatch.setenv("SESSION_TIMEOUT_SECONDS", "600")
 
     assert config.load().session_timeout_seconds == 600
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_session_timeout_must_be_positive(monkeypatch, value):
+    _set_all(monkeypatch)
+    monkeypatch.setenv("SESSION_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(config.ConfigError, match="SESSION_TIMEOUT_SECONDS"):
+        config.load()

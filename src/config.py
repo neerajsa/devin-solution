@@ -35,6 +35,12 @@ def load() -> Config:
     if missing:
         raise ConfigError(f"missing required environment variable(s): {', '.join(missing)}")
 
+    session_timeout_seconds = int(
+        os.environ.get("SESSION_TIMEOUT_SECONDS") or DEFAULT_SESSION_TIMEOUT_SECONDS
+    )
+    if session_timeout_seconds <= 0:
+        raise ConfigError("SESSION_TIMEOUT_SECONDS must be a positive number of seconds")
+
     return Config(
         webhook_secret=os.environ["WEBHOOK_SECRET"],
         devin_api_key=os.environ["DEVIN_API_KEY"],
@@ -42,7 +48,5 @@ def load() -> Config:
         github_token=os.environ["GITHUB_TOKEN"],
         github_repo=os.environ["GITHUB_REPO"],
         scan_interval_seconds=int(os.environ.get("SCAN_INTERVAL_SECONDS") or DEFAULT_SCAN_INTERVAL_SECONDS),
-        session_timeout_seconds=int(
-            os.environ.get("SESSION_TIMEOUT_SECONDS") or DEFAULT_SESSION_TIMEOUT_SECONDS
-        ),
+        session_timeout_seconds=session_timeout_seconds,
     )
