@@ -133,3 +133,46 @@ def test_start_and_finish_run(conn):
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     assert row["finished_at"] is not None
     assert row["findings_count"] == 3
+
+
+def test_reset_in_flight_findings_only_resets_dispatching_without_a_session(conn):
+    def _finding(fp):
+        return store.insert_finding(
+            conn, fingerprint=fp, source="pip-audit", finding_class="dependency-cve",
+            severity="unrated", summary=fp,
+        )
+
+    orphan = _finding("fp-orphan")
+    with_session = _finding("fp-with-session")
+    untouched = _finding("fp-new")
+    done = _finding("fp-done")
+    store.claim_finding_for_dispatch(conn, orphan)
+    store.claim_finding_for_dispatch(conn, with_session)
+    store.update_finding_status(conn, done, "remediated")
+    store.upsert_session(
+        conn, session_id=None, finding_id=with_session, devin_session_id="d-1",
+        devin_url="https://app.devin.ai/sessions/d-1", state="working",
+    )
+
+    assert store.reset_in_flight_findings(conn) == 1
+    assert store.get_finding(conn, orphan)["status"] == "new"
+    assert store.get_finding(conn, with_session)["status"] == "dispatching"
+    assert store.get_finding(conn, untouched)["status"] == "new"
+    assert store.get_finding(conn, done)["status"] == "remediated"
+
+
+def test_list_non_terminal_sessions_excludes_terminal_ones(conn):
+    finding_id = store.insert_finding(
+        conn, fingerprint="fp", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="fp",
+    )
+    working = store.upsert_session(
+        conn, session_id=None, finding_id=finding_id, devin_session_id="d-1",
+        devin_url="https://app.devin.ai/sessions/d-1", state="working",
+    )
+    store.upsert_session(
+        conn, session_id=None, finding_id=finding_id, devin_session_id="d-2",
+        devin_url="https://app.devin.ai/sessions/d-2", state="remediated", terminal=True,
+    )
+
+    assert [row["id"] for row in store.list_non_terminal_sessions(conn)] == [working]
