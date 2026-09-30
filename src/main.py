@@ -138,13 +138,18 @@ async def _resume_session(row) -> None:
         state = result["state"]
     except DevinAPIError as e:
         if e.status_code != 404:
-            # 401/403 and friends say nothing about the Devin session, which is
-            # very likely still running and billing. Leave the row non-terminal
-            # so the next startup resumes it once credentials are fixed -
-            # marking it terminal here would hide it from
-            # list_non_terminal_sessions forever. (Transient 429/5xx never
-            # reach this: _poll_to_terminal retries those itself.)
-            logger.exception("failed to resume session %s - leaving it for the next restart", session_id)
+            # 401/403/400 and friends say nothing about the Devin session, which
+            # is very likely still running and billing, and nothing polls it
+            # until the next restart. Surface the finding as needs_human, but
+            # leave the session row non-terminal so the next startup still
+            # resumes it (and records its real outcome) once the cause is
+            # fixed. (Transient 429/5xx never reach this: _poll_to_terminal
+            # retries those itself.)
+            logger.exception(
+                "failed to resume session %s - flagging needs_human, will retry on next restart",
+                session_id,
+            )
+            store.update_finding_status(_conn, row["finding_id"], "needs_human")
             return
         logger.warning("devin session %s no longer exists - marking needs_human", devin_session_id)
         state = "needs_human"

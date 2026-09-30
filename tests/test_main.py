@@ -436,9 +436,12 @@ def _insert_working_session(conn, fingerprint, devin_session_id):
 
 
 @pytest.mark.asyncio
-async def test_resume_session_leaves_session_for_next_restart_on_auth_error(monkeypatch, fresh_conn):
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+async def test_resume_session_flags_finding_but_stays_resumable_on_permanent_error(
+    monkeypatch, fresh_conn, status_code,
+):
     finding_id, session_id = _insert_working_session(fresh_conn, "fp-unauth", "devin-unauth")
-    fake_devin = FakeDevinClientForRecovery({"devin-unauth": DevinAPIError(401, "unauthorized")})
+    fake_devin = FakeDevinClientForRecovery({"devin-unauth": DevinAPIError(status_code, "nope")})
     monkeypatch.setattr(main, "_orchestrator", Orchestrator(
         devin_client=fake_devin, conn=fresh_conn, repo="x/y", poll_interval=0,
     ))
@@ -446,9 +449,10 @@ async def test_resume_session_leaves_session_for_next_restart_on_auth_error(monk
     await asyncio.gather(*main._recover_in_flight())
 
     # The Devin session is very likely still running - stay resumable rather
-    # than recording a terminal state we have no evidence for.
+    # than recording a terminal state we have no evidence for, but make the
+    # finding visible to a human since nothing is polling it now.
     row = store.get_session(fresh_conn, session_id)
     assert row["state"] == "working"
     assert row["terminal_at"] is None
-    assert store.get_finding(fresh_conn, finding_id)["status"] == "dispatching"
+    assert store.get_finding(fresh_conn, finding_id)["status"] == "needs_human"
     assert [r["id"] for r in store.list_non_terminal_sessions(fresh_conn)] == [session_id]
