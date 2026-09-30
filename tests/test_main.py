@@ -1,8 +1,13 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -422,3 +427,126 @@ async def test_startup_handler_runs_crash_recovery(monkeypatch, fresh_conn):
     await main._start_scan_scheduler()
 
     assert store.get_finding(fresh_conn, finding_id)["status"] == "new"
+
+
+# --- /webhooks/github - delivery consumption order ---
+#
+# A delivery is recorded 'received' before handling and only marked
+# 'processed' after handling succeeds. A failure returns 5xx and leaves it
+# retryable, so a redelivery of the same X-GitHub-Delivery id is handled again
+# instead of being dropped as a duplicate.
+
+def _issue_delivery(delivery_id: str, issue_number: int = 7) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps({
+        "action": "labeled",
+        "label": {"name": "devin-autofix"},
+        "issue": {
+            "number": issue_number, "title": "Crash on login", "body": "Steps to reproduce...",
+            "html_url": f"https://github.com/x/y/issues/{issue_number}",
+            "labels": [{"name": "devin-autofix"}],
+        },
+    }).encode()
+    signature = "sha256=" + hmac.new(
+        main._cfg.webhook_secret.encode(), body, hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "x-hub-signature-256": signature,
+        "x-github-delivery": delivery_id,
+        "x-github-event": "issues",
+        "content-type": "application/json",
+    }
+    return body, headers
+
+
+async def _post_webhook(body: bytes, headers: dict[str, str]) -> httpx.Response:
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/webhooks/github", content=body, headers=headers)
+    for _ in range(5):
+        await asyncio.sleep(0)  # let the fire-and-forget _dispatch task run
+    return response
+
+
+def _run_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_call", ["set_finding_issue", "start_run"])
+async def test_webhook_failure_leaves_delivery_retryable_and_redelivery_dispatches_once(
+        monkeypatch, fresh_conn, failing_call):
+    fake_orch = FakeOrchestratorForScan()
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+
+    real_call = getattr(store, failing_call)
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_call(*args, **kwargs)
+
+    monkeypatch.setattr(store, failing_call, flaky)
+
+    body, headers = _issue_delivery("delivery-fail-1")
+    first = await _post_webhook(body, headers)
+
+    assert first.status_code == 500
+    assert store.get_delivery_status(fresh_conn, "delivery-fail-1") == "received"
+    assert store.get_finding_by_fingerprint(fresh_conn, "github-issue-7")["status"] == "new"
+    assert fake_orch.dispatched == []
+
+    redelivery = await _post_webhook(body, headers)
+
+    assert redelivery.status_code == 200
+    assert redelivery.json() == {"status": "accepted"}
+    assert store.get_delivery_status(fresh_conn, "delivery-fail-1") == "processed"
+    assert [(fp, issue) for fp, _, issue in fake_orch.dispatched] == [("github-issue-7", 7)]
+    assert store.get_finding_by_fingerprint(fresh_conn, "github-issue-7")["issue_number"] == 7
+
+
+@pytest.mark.asyncio
+async def test_webhook_redelivery_after_success_is_a_no_op(monkeypatch, fresh_conn):
+    fake_orch = FakeOrchestratorForScan()
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+
+    body, headers = _issue_delivery("delivery-ok-1")
+    first = await _post_webhook(body, headers)
+
+    assert first.status_code == 200
+    assert first.json() == {"status": "accepted"}
+    assert store.get_delivery_status(fresh_conn, "delivery-ok-1") == "processed"
+    assert len(fake_orch.dispatched) == 1
+    assert _run_count(fresh_conn) == 1
+
+    redelivery = await _post_webhook(body, headers)
+
+    assert redelivery.status_code == 200
+    assert redelivery.json() == {"status": "duplicate_or_missing_delivery_id"}
+    assert len(fake_orch.dispatched) == 1
+    assert _run_count(fresh_conn) == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_rehandling_an_unprocessed_delivery_is_idempotent(monkeypatch, fresh_conn):
+    # Handling completed (finding claimed, dispatch started) but the process
+    # died before the delivery was marked processed. The redelivery is handled
+    # again, and fingerprint dedup keeps it from dispatching a second session.
+    fake_orch = FakeOrchestratorForScan()
+    monkeypatch.setattr(main, "_orchestrator", fake_orch)
+
+    body, headers = _issue_delivery("delivery-crash-1")
+    assert (await _post_webhook(body, headers)).status_code == 200
+    fresh_conn.execute(
+        "UPDATE deliveries SET status = 'received' WHERE delivery_id = ?", ("delivery-crash-1",),
+    )
+    fresh_conn.commit()
+
+    redelivery = await _post_webhook(body, headers)
+
+    assert redelivery.status_code == 200
+    assert redelivery.json() == {"status": "accepted"}
+    assert store.get_delivery_status(fresh_conn, "delivery-crash-1") == "processed"
+    assert len(fake_orch.dispatched) == 1
+    assert _run_count(fresh_conn) == 1

@@ -172,22 +172,31 @@ async def github_webhook(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=401, detail="invalid signature")
 
     delivery_id = request.headers.get("x-github-delivery")
-    if not delivery_id or not store.record_delivery(_conn, delivery_id):
+    if not delivery_id:
         return {"status": "duplicate_or_missing_delivery_id"}
+    if not store.record_delivery(_conn, delivery_id):
+        if store.get_delivery_status(_conn, delivery_id) == "processed":
+            return {"status": "duplicate_or_missing_delivery_id"}
+        # Seen before but never marked processed: an earlier attempt failed
+        # or the process died mid-handling. Handle it again - that's safe
+        # because _handle_issue_finding is idempotent per finding fingerprint
+        # (insert_finding/set_finding_issue are upserts, and only one caller
+        # can ever win claim_finding_for_dispatch).
+        logger.warning("retrying unprocessed delivery %s", delivery_id)
 
     event = request.headers.get("x-github-event")
     payload = json.loads(body) if body else {}
 
     if event == "issues" and _has_devin_autofix_trigger(payload):
-        # The delivery is already recorded as seen above, so a redelivery of
-        # this same event won't be retried by us even if handling fails here
-        # (GitHub would just get a 200 either way). Never let a downstream
-        # API hiccup turn into a crashed webhook endpoint - log and move on.
         try:
             await _handle_issue_finding(payload["issue"])
         except Exception:
+            # Leave the delivery 'received' and fail the request so the
+            # delivery shows as failed on GitHub and a redelivery retries it.
             logger.exception("failed to handle issues event for delivery %s", delivery_id)
+            raise HTTPException(status_code=500, detail="delivery handling failed")
 
+    store.mark_delivery_processed(_conn, delivery_id)
     return {"status": "accepted"}
 
 
@@ -246,7 +255,13 @@ async def _handle_issue_finding(issue: dict) -> None:
         # skip rather than start a second Devin session for the same work.
         return
 
-    run_id = store.start_run(_conn, trigger="issue_labeled")
+    try:
+        run_id = store.start_run(_conn, trigger="issue_labeled")
+    except Exception:
+        # Nothing has been dispatched yet - release the claim so a
+        # redelivery of this event can claim it again.
+        store.update_finding_status(_conn, finding_row["id"], "new")
+        raise
     asyncio.create_task(_dispatch(_finding_from_row(finding_row), run_id, issue["number"]))
 
 
