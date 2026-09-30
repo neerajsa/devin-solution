@@ -1,3 +1,4 @@
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -108,6 +109,33 @@ def test_record_delivery_dedupes(conn):
     assert store.record_delivery(conn, "delivery-1") is True
     assert store.record_delivery(conn, "delivery-1") is False
     assert store.record_delivery(conn, "delivery-2") is True
+
+
+def test_delivery_is_received_until_marked_processed(conn):
+    assert store.get_delivery_status(conn, "delivery-1") is None
+    assert store.record_delivery(conn, "delivery-1") is True
+    assert store.get_delivery_status(conn, "delivery-1") == "received"
+    store.mark_delivery_processed(conn, "delivery-1")
+    assert store.get_delivery_status(conn, "delivery-1") == "processed"
+    assert store.record_delivery(conn, "delivery-1") is False
+    assert store.get_delivery_status(conn, "delivery-1") == "processed"
+
+
+def test_connect_migrates_legacy_deliveries_as_processed(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    legacy = sqlite3.connect(path)
+    legacy.execute("CREATE TABLE deliveries (delivery_id TEXT PRIMARY KEY, received_at REAL NOT NULL)")
+    legacy.execute("INSERT INTO deliveries VALUES ('old-delivery', 0)")
+    legacy.commit()
+    legacy.close()
+
+    c = store.connect(path)
+    try:
+        assert store.get_delivery_status(c, "old-delivery") == "processed"
+        assert store.record_delivery(c, "new-delivery") is True
+        assert store.get_delivery_status(c, "new-delivery") == "received"
+    finally:
+        c.close()
 
 
 def test_claim_finding_for_dispatch_is_exclusive(conn):

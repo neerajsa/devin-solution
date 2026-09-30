@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id TEXT PRIMARY KEY,
-    received_at REAL NOT NULL
+    received_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'received'
 );
 """
 
@@ -66,7 +67,20 @@ def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate_deliveries_status(conn)
     return conn
+
+
+def _migrate_deliveries_status(conn: sqlite3.Connection) -> None:
+    # Databases created before deliveries had a status column only ever
+    # recorded a delivery after (or regardless of) handling it, so existing
+    # rows are treated as already processed.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(deliveries)")}
+    if "status" not in columns:
+        conn.execute(
+            "ALTER TABLE deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'processed'"
+        )
+        conn.commit()
 
 
 def insert_finding(conn: sqlite3.Connection, *, fingerprint: str, source: str,
@@ -227,10 +241,25 @@ def finish_run(conn: sqlite3.Connection, run_id: str, *, findings_count: int, se
 
 
 def record_delivery(conn: sqlite3.Connection, delivery_id: str) -> bool:
-    """Record a webhook delivery. Returns True if new, False if this delivery_id was already seen."""
+    """Record a webhook delivery as 'received'. Returns True if new, False if this
+    delivery_id was already seen (in any status - see get_delivery_status)."""
     cur = conn.execute(
-        "INSERT OR IGNORE INTO deliveries (delivery_id, received_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO deliveries (delivery_id, received_at, status) VALUES (?, ?, 'received')",
         (delivery_id, time.time()),
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def get_delivery_status(conn: sqlite3.Connection, delivery_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT status FROM deliveries WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    return row["status"] if row else None
+
+
+def mark_delivery_processed(conn: sqlite3.Connection, delivery_id: str) -> None:
+    conn.execute(
+        "UPDATE deliveries SET status = 'processed' WHERE delivery_id = ?", (delivery_id,)
+    )
+    conn.commit()
