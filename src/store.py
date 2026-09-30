@@ -126,6 +126,25 @@ def claim_finding_for_dispatch(conn: sqlite3.Connection, finding_id: str) -> boo
     return cur.rowcount > 0
 
 
+def reset_in_flight_findings(conn: sqlite3.Connection) -> int:
+    """Revert 'dispatching' findings with no recorded session back to 'new'.
+
+    Called at startup: a finding left 'dispatching' by a crashed process with
+    no sessions row never got a Devin session recorded, so it's safe to retry.
+    Findings that DO have a session row are left alone - their session is
+    resumed instead (see list_non_terminal_sessions), never re-dispatched.
+    Returns the number of findings reset.
+    """
+    cur = conn.execute(
+        """UPDATE findings SET status = 'new', updated_at = ?
+           WHERE status = 'dispatching'
+             AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.finding_id = findings.id)""",
+        (time.time(),),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def set_finding_issue(conn: sqlite3.Connection, finding_id: str, *,
                        issue_number: int, issue_url: str) -> None:
     conn.execute(
@@ -180,6 +199,13 @@ def upsert_session(conn: sqlite3.Connection, *, session_id: str | None,
 
 def get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+
+
+def list_non_terminal_sessions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Sessions that never reached a terminal outcome (e.g. orphaned by a restart)."""
+    return conn.execute(
+        "SELECT * FROM sessions WHERE terminal_at IS NULL ORDER BY created_at"
+    ).fetchall()
 
 
 def start_run(conn: sqlite3.Connection, trigger: str) -> str:

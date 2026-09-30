@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -20,7 +21,8 @@ os.environ.setdefault("GITHUB_REPO", "neerajsa/superset")
 
 import main  # noqa: E402
 import store  # noqa: E402
-from orchestrator import DispatchNotStartedError  # noqa: E402
+from devin import DevinAPIError  # noqa: E402
+from orchestrator import DispatchNotStartedError, Orchestrator  # noqa: E402
 from scanners import Finding  # noqa: E402
 
 
@@ -323,3 +325,100 @@ def test_scan_and_file_demo_does_not_affect_production_scan_targets():
     assert main.DEMO_SCAN_TARGET != main.SCAN_TARGETS
     assert main.DEMO_SCAN_TARGET == ["requirements/base.txt"]
     assert main.DEMO_SCAN_TARGET_FALLBACK == ["requirements/development.txt"]
+
+
+# --- main._recover_in_flight - startup crash recovery ---
+#
+# A process restart used to leave findings stuck in 'dispatching' and session
+# rows stuck in 'working' forever, while the real Devin sessions kept running
+# (and billing) with nobody polling them.
+
+class FakeDevinClientForRecovery:
+    def __init__(self, sessions: dict[str, dict | Exception]):
+        self._sessions = sessions
+        self.terminated: list[str] = []
+
+    async def get_session(self, devin_session_id):
+        result = self._sessions[devin_session_id]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def send_message(self, devin_session_id, message):
+        pass
+
+    async def terminate_session(self, devin_session_id, *, archive=True):
+        self.terminated.append(devin_session_id)
+
+
+def _insert_dispatching_finding(conn, fingerprint):
+    finding_id = store.insert_finding(
+        conn, fingerprint=fingerprint, source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary=f"{fingerprint} CVE",
+    )
+    assert store.claim_finding_for_dispatch(conn, finding_id)
+    return finding_id
+
+
+@pytest.mark.asyncio
+async def test_recover_in_flight_resumes_orphaned_sessions_and_resets_unstarted_findings(
+        monkeypatch, fresh_conn):
+    no_session_id = _insert_dispatching_finding(fresh_conn, "fp-no-session")
+    alive_id = _insert_dispatching_finding(fresh_conn, "fp-alive")
+    gone_id = _insert_dispatching_finding(fresh_conn, "fp-gone")
+    alive_session = store.upsert_session(
+        fresh_conn, session_id=None, finding_id=alive_id, devin_session_id="devin-alive",
+        devin_url="https://app.devin.ai/sessions/devin-alive", state="working",
+    )
+    gone_session = store.upsert_session(
+        fresh_conn, session_id=None, finding_id=gone_id, devin_session_id="devin-gone",
+        devin_url="https://app.devin.ai/sessions/devin-gone", state="working",
+    )
+
+    fake_devin = FakeDevinClientForRecovery({
+        "devin-alive": {
+            "status": "running", "status_detail": "working",
+            "structured_output": {"status": "remediated"},
+            "pull_requests": [{"pr_url": "https://github.com/x/y/pull/9"}],
+        },
+        "devin-gone": DevinAPIError(404, "not found"),
+    })
+    monkeypatch.setattr(main, "_orchestrator", Orchestrator(
+        devin_client=fake_devin, conn=fresh_conn, repo="x/y", poll_interval=0,
+    ))
+
+    tasks = main._recover_in_flight()
+    await asyncio.gather(*tasks)
+
+    # No session was ever recorded - safe to retry.
+    assert store.get_finding(fresh_conn, no_session_id)["status"] == "new"
+
+    # Still-alive session was polled to its real terminal outcome and terminated.
+    alive_row = store.get_session(fresh_conn, alive_session)
+    assert alive_row["state"] == "remediated"
+    assert alive_row["pr_url"] == "https://github.com/x/y/pull/9"
+    assert alive_row["terminal_at"] is not None
+    assert store.get_finding(fresh_conn, alive_id)["status"] == "remediated"
+    assert fake_devin.terminated == ["devin-alive"]
+
+    # Devin session is gone (404) - marked needs_human, never re-dispatched.
+    gone_row = store.get_session(fresh_conn, gone_session)
+    assert gone_row["state"] == "needs_human"
+    assert gone_row["terminal_at"] is not None
+    assert store.get_finding(fresh_conn, gone_id)["status"] == "needs_human"
+
+    assert store.list_non_terminal_sessions(fresh_conn) == []
+
+
+@pytest.mark.asyncio
+async def test_startup_handler_runs_crash_recovery(monkeypatch, fresh_conn):
+    finding_id = _insert_dispatching_finding(fresh_conn, "fp-startup")
+
+    async def _no_scan_loop():
+        return None
+
+    monkeypatch.setattr(main, "_scan_loop", _no_scan_loop)
+
+    await main._start_scan_scheduler()
+
+    assert store.get_finding(fresh_conn, finding_id)["status"] == "new"
