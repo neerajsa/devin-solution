@@ -113,40 +113,63 @@ async def _start_scan_scheduler() -> None:
 def _recover_in_flight() -> list[asyncio.Task]:
     """Recover state orphaned by a process restart.
 
-    Findings stuck in 'dispatching' with no recorded session are made
-    retryable again; sessions still in a non-terminal state are resumed -
-    their real Devin sessions keep running (and billing) regardless of us.
+    Findings stuck in 'dispatching' with no recorded session are flagged
+    needs_human (a Devin session may exist that we never recorded); sessions
+    still in a non-terminal state are resumed - their real Devin sessions
+    keep running (and billing) regardless of us.
     """
-    reset = store.reset_in_flight_findings(_conn)
-    if reset:
-        logger.warning("reset %d in-flight finding(s) with no session back to 'new'", reset)
+    flagged = store.flag_orphaned_dispatching_findings(_conn)
+    if flagged:
+        logger.warning(
+            "flagged %d in-flight finding(s) with no recorded session as needs_human", flagged,
+        )
     return [
         asyncio.create_task(_resume_session(row))
         for row in store.list_non_terminal_sessions(_conn)
     ]
 
 
+RESUME_RETRY_INITIAL_SECONDS = 15.0
+RESUME_RETRY_MAX_SECONDS = 300.0
+
+
+def _is_retriable(e: DevinAPIError) -> bool:
+    return e.status_code == 429 or e.status_code >= 500
+
+
 async def _resume_session(row) -> None:
     session_id = row["id"]
     devin_session_id = row["devin_session_id"]
     logger.warning("resuming orphaned session %s (devin %s)", session_id, devin_session_id)
-    try:
-        result = await _orchestrator._poll_to_terminal(session_id, devin_session_id)
-        state = result["state"]
-    except DevinAPIError as e:
-        if e.status_code != 404:
+    delay = RESUME_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            result = await _orchestrator._poll_to_terminal(session_id, devin_session_id)
+            state = result["state"]
+            break
+        except DevinAPIError as e:
+            if _is_retriable(e):
+                logger.warning(
+                    "retriable error resuming session %s (HTTP %d) - retrying in %.0fs",
+                    session_id, e.status_code, delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RESUME_RETRY_MAX_SECONDS)
+                continue
+            if e.status_code == 404:
+                logger.warning("devin session %s no longer exists - marking needs_human", devin_session_id)
+            else:
+                logger.exception("non-retriable error resuming session %s - marking needs_human", session_id)
+            state = "needs_human"
+            store.upsert_session(
+                _conn, session_id=session_id, state=state, pr_url=row["pr_url"],
+                acu_used=row["acu_used"], human_messages_sent=row["human_messages_sent"],
+                terminal=True,
+            )
+            break
+        except Exception:
             logger.exception("failed to resume session %s", session_id)
             return
-        logger.warning("devin session %s no longer exists - marking needs_human", devin_session_id)
-        state = "needs_human"
-        store.upsert_session(
-            _conn, session_id=session_id, state=state, pr_url=row["pr_url"],
-            acu_used=row["acu_used"], human_messages_sent=row["human_messages_sent"],
-            terminal=True,
-        )
-    except Exception:
-        logger.exception("failed to resume session %s", session_id)
-        return
     store.update_finding_status(_conn, row["finding_id"], state)
 
 

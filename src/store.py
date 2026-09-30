@@ -126,17 +126,19 @@ def claim_finding_for_dispatch(conn: sqlite3.Connection, finding_id: str) -> boo
     return cur.rowcount > 0
 
 
-def reset_in_flight_findings(conn: sqlite3.Connection) -> int:
-    """Revert 'dispatching' findings with no recorded session back to 'new'.
+def flag_orphaned_dispatching_findings(conn: sqlite3.Connection) -> int:
+    """Move 'dispatching' findings with no recorded session to 'needs_human'.
 
     Called at startup: a finding left 'dispatching' by a crashed process with
-    no sessions row never got a Devin session recorded, so it's safe to retry.
-    Findings that DO have a session row are left alone - their session is
-    resumed instead (see list_non_terminal_sessions), never re-dispatched.
-    Returns the number of findings reset.
+    no sessions row is ambiguous - the process may have died before
+    create_session, or after Devin accepted it but before upsert_session
+    recorded it. Re-dispatching could start a duplicate, still-billing
+    session, so these go to a human to reconcile instead. Findings that DO
+    have a session row are left alone - their session is resumed instead
+    (see list_non_terminal_sessions). Returns the number of findings flagged.
     """
     cur = conn.execute(
-        """UPDATE findings SET status = 'new', updated_at = ?
+        """UPDATE findings SET status = 'needs_human', updated_at = ?
            WHERE status = 'dispatching'
              AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.finding_id = findings.id)""",
         (time.time(),),
