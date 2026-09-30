@@ -135,7 +135,7 @@ def test_start_and_finish_run(conn):
     assert row["findings_count"] == 3
 
 
-def test_reset_in_flight_findings_only_resets_dispatching_without_a_session(conn):
+def test_flag_orphaned_dispatching_findings_only_flags_dispatching_without_a_session(conn):
     def _finding(fp):
         return store.insert_finding(
             conn, fingerprint=fp, source="pip-audit", finding_class="dependency-cve",
@@ -154,8 +154,8 @@ def test_reset_in_flight_findings_only_resets_dispatching_without_a_session(conn
         devin_url="https://app.devin.ai/sessions/d-1", state="working",
     )
 
-    assert store.reset_in_flight_findings(conn) == 1
-    assert store.get_finding(conn, orphan)["status"] == "new"
+    assert store.flag_orphaned_dispatching_findings(conn) == 1
+    assert store.get_finding(conn, orphan)["status"] == "needs_human"
     assert store.get_finding(conn, with_session)["status"] == "dispatching"
     assert store.get_finding(conn, untouched)["status"] == "new"
     assert store.get_finding(conn, done)["status"] == "remediated"

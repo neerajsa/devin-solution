@@ -28,7 +28,7 @@ import httpx
 
 import prompts
 import store
-from devin import DevinClient
+from devin import DevinAPIError, DevinClient
 from scanners import Finding
 
 logger = logging.getLogger("orchestrator")
@@ -45,6 +45,8 @@ class DispatchNotStartedError(Exception):
 TERMINAL_SESSION_STATUS = {"exit", "error"}
 BLOCKED_DETAILS = {"waiting_for_user", "waiting_for_approval"}
 PR_BACKED_CLAIMS = {"remediated", "partially_remediated"}
+API_RETRY_INITIAL_SECONDS = 15.0
+API_RETRY_MAX_SECONDS = 300.0
 NO_PR_NEEDED_CLAIMS = {"not_applicable", "needs_human"}
 
 
@@ -157,6 +159,7 @@ class Orchestrator:
     async def _poll_to_terminal(self, session_id: str, devin_session_id: str) -> dict:
         nudged_at: float | None = None
         human_messages_sent = 0
+        api_retry_delay = API_RETRY_INITIAL_SECONDS
 
         while True:
             try:
@@ -173,11 +176,33 @@ class Orchestrator:
                 # 2026-08-19 showed exactly why giving up early is the wrong
                 # trade: a single httpx.ReadTimeout mid-poll orphaned a
                 # healthy, already-running flask session for hours. A real,
-                # non-transient failure (DevinAPIError - 401/404/500) is
+                # non-transient failure (DevinAPIError - 401/404) is
                 # informative and still propagates immediately, unchanged.
                 logger.warning("transient network error polling session %s - retrying", devin_session_id)
                 await asyncio.sleep(self._poll_interval)
                 continue
+            except DevinAPIError as e:
+                # A 429 or a 5xx says nothing about the session's real state
+                # either - same position as a transport error above, so it gets
+                # the same treatment, with backoff since the server is the one
+                # asking us to slow down. Retrying here rather than in a caller
+                # keeps this loop's own blocked-nudge state (nudged_at,
+                # human_messages_sent) intact across the error: a caller that
+                # restarted the whole poll would reset the nudge timer on every
+                # transient error and re-nudge a blocked session forever instead
+                # of timing it out. A 4xx other than 429 (401/403/404) is real
+                # information and still propagates immediately.
+                if not (e.status_code == 429 or e.status_code >= 500):
+                    raise
+                logger.warning(
+                    "retriable API error polling session %s (HTTP %d) - retrying in %.0fs",
+                    devin_session_id, e.status_code, api_retry_delay,
+                )
+                await asyncio.sleep(api_retry_delay)
+                api_retry_delay = min(api_retry_delay * 2, API_RETRY_MAX_SECONDS)
+                continue
+
+            api_retry_delay = API_RETRY_INITIAL_SECONDS
 
             state, pr_url = resolve(raw)
 

@@ -334,12 +334,14 @@ def test_scan_and_file_demo_does_not_affect_production_scan_targets():
 # (and billing) with nobody polling them.
 
 class FakeDevinClientForRecovery:
-    def __init__(self, sessions: dict[str, dict | Exception]):
+    def __init__(self, sessions: dict[str, dict | Exception | list[dict | Exception]]):
         self._sessions = sessions
         self.terminated: list[str] = []
 
     async def get_session(self, devin_session_id):
         result = self._sessions[devin_session_id]
+        if isinstance(result, list):
+            result = result.pop(0)
         if isinstance(result, Exception):
             raise result
         return result
@@ -361,7 +363,7 @@ def _insert_dispatching_finding(conn, fingerprint):
 
 
 @pytest.mark.asyncio
-async def test_recover_in_flight_resumes_orphaned_sessions_and_resets_unstarted_findings(
+async def test_recover_in_flight_resumes_orphaned_sessions_and_flags_unrecorded_findings(
         monkeypatch, fresh_conn):
     no_session_id = _insert_dispatching_finding(fresh_conn, "fp-no-session")
     alive_id = _insert_dispatching_finding(fresh_conn, "fp-alive")
@@ -390,8 +392,8 @@ async def test_recover_in_flight_resumes_orphaned_sessions_and_resets_unstarted_
     tasks = main._recover_in_flight()
     await asyncio.gather(*tasks)
 
-    # No session was ever recorded - safe to retry.
-    assert store.get_finding(fresh_conn, no_session_id)["status"] == "new"
+    # No session recorded, but one may exist on Devin - never auto-redispatched.
+    assert store.get_finding(fresh_conn, no_session_id)["status"] == "needs_human"
 
     # Still-alive session was polled to its real terminal outcome and terminated.
     alive_row = store.get_session(fresh_conn, alive_session)
@@ -421,4 +423,36 @@ async def test_startup_handler_runs_crash_recovery(monkeypatch, fresh_conn):
 
     await main._start_scan_scheduler()
 
-    assert store.get_finding(fresh_conn, finding_id)["status"] == "new"
+    assert store.get_finding(fresh_conn, finding_id)["status"] == "needs_human"
+
+
+def _insert_working_session(conn, fingerprint, devin_session_id):
+    finding_id = _insert_dispatching_finding(conn, fingerprint)
+    session_id = store.upsert_session(
+        conn, session_id=None, finding_id=finding_id, devin_session_id=devin_session_id,
+        devin_url=f"https://app.devin.ai/sessions/{devin_session_id}", state="working",
+    )
+    return finding_id, session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+async def test_resume_session_flags_finding_but_stays_resumable_on_permanent_error(
+    monkeypatch, fresh_conn, status_code,
+):
+    finding_id, session_id = _insert_working_session(fresh_conn, "fp-unauth", "devin-unauth")
+    fake_devin = FakeDevinClientForRecovery({"devin-unauth": DevinAPIError(status_code, "nope")})
+    monkeypatch.setattr(main, "_orchestrator", Orchestrator(
+        devin_client=fake_devin, conn=fresh_conn, repo="x/y", poll_interval=0,
+    ))
+
+    await asyncio.gather(*main._recover_in_flight())
+
+    # The Devin session is very likely still running - stay resumable rather
+    # than recording a terminal state we have no evidence for, but make the
+    # finding visible to a human since nothing is polling it now.
+    row = store.get_session(fresh_conn, session_id)
+    assert row["state"] == "working"
+    assert row["terminal_at"] is None
+    assert store.get_finding(fresh_conn, finding_id)["status"] == "needs_human"
+    assert [r["id"] for r in store.list_non_terminal_sessions(fresh_conn)] == [session_id]
