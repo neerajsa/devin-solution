@@ -129,47 +129,33 @@ def _recover_in_flight() -> list[asyncio.Task]:
     ]
 
 
-RESUME_RETRY_INITIAL_SECONDS = 15.0
-RESUME_RETRY_MAX_SECONDS = 300.0
-
-
-def _is_retriable(e: DevinAPIError) -> bool:
-    return e.status_code == 429 or e.status_code >= 500
-
-
 async def _resume_session(row) -> None:
     session_id = row["id"]
     devin_session_id = row["devin_session_id"]
     logger.warning("resuming orphaned session %s (devin %s)", session_id, devin_session_id)
-    delay = RESUME_RETRY_INITIAL_SECONDS
-    while True:
-        try:
-            result = await _orchestrator._poll_to_terminal(session_id, devin_session_id)
-            state = result["state"]
-            break
-        except DevinAPIError as e:
-            if _is_retriable(e):
-                logger.warning(
-                    "retriable error resuming session %s (HTTP %d) - retrying in %.0fs",
-                    session_id, e.status_code, delay,
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RESUME_RETRY_MAX_SECONDS)
-                continue
-            if e.status_code == 404:
-                logger.warning("devin session %s no longer exists - marking needs_human", devin_session_id)
-            else:
-                logger.exception("non-retriable error resuming session %s - marking needs_human", session_id)
-            state = "needs_human"
-            store.upsert_session(
-                _conn, session_id=session_id, state=state, pr_url=row["pr_url"],
-                acu_used=row["acu_used"], human_messages_sent=row["human_messages_sent"],
-                terminal=True,
-            )
-            break
-        except Exception:
-            logger.exception("failed to resume session %s", session_id)
+    try:
+        result = await _orchestrator._poll_to_terminal(session_id, devin_session_id)
+        state = result["state"]
+    except DevinAPIError as e:
+        if e.status_code != 404:
+            # 401/403 and friends say nothing about the Devin session, which is
+            # very likely still running and billing. Leave the row non-terminal
+            # so the next startup resumes it once credentials are fixed -
+            # marking it terminal here would hide it from
+            # list_non_terminal_sessions forever. (Transient 429/5xx never
+            # reach this: _poll_to_terminal retries those itself.)
+            logger.exception("failed to resume session %s - leaving it for the next restart", session_id)
             return
+        logger.warning("devin session %s no longer exists - marking needs_human", devin_session_id)
+        state = "needs_human"
+        store.upsert_session(
+            _conn, session_id=session_id, state=state, pr_url=row["pr_url"],
+            acu_used=row["acu_used"], human_messages_sent=row["human_messages_sent"],
+            terminal=True,
+        )
+    except Exception:
+        logger.exception("failed to resume session %s", session_id)
+        return
     store.update_finding_status(_conn, row["finding_id"], state)
 
 

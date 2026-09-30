@@ -309,8 +309,8 @@ async def test_poll_retries_transient_failures_with_no_cap(conn):
 
 @pytest.mark.asyncio
 async def test_poll_still_propagates_a_real_non_transient_api_error(conn):
-    # A genuine DevinAPIError (401/404/500 - not httpx.TransportError) is
-    # informative and must still fail fast, unlike a network blip.
+    # A genuine DevinAPIError (401/404 - not httpx.TransportError, not a
+    # retriable 429/5xx) is informative and must still fail fast.
     from devin import DevinAPIError
 
     class BrokenSessionDevinClient(FakeDevinClient):
@@ -349,3 +349,54 @@ async def test_terminate_failure_does_not_block_recording_the_outcome(conn):
     assert row["terminal_at"] is not None
     finding_row = store.get_finding_by_fingerprint(conn, finding.fingerprint)
     assert finding_row["status"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_retriable_api_errors_without_resetting_the_nudge_timer(conn, monkeypatch):
+    """A 429/5xx carries no information about the session - retry, and keep the
+    blocked-nudge state, so a session alternating blocked responses with errors
+    still times out to needs_human instead of being nudged forever."""
+    from devin import DevinAPIError
+
+    blocked = {"status": "suspended", "structured_output": None, "pull_requests": []}
+
+    class FlakyDevinClient(FakeDevinClient):
+        async def get_session(self, session_id):
+            result = self._sequence.pop(0) if len(self._sequence) > 1 else self._sequence[0]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    fake = FlakyDevinClient([blocked, DevinAPIError(500, "boom"), DevinAPIError(429, "slow"), blocked])
+    monkeypatch.setattr(orchestrator, "API_RETRY_INITIAL_SECONDS", 0)
+    orch = orchestrator.Orchestrator(devin_client=fake, conn=conn, repo="x/y", poll_interval=0,
+                                     blocked_nudge_timeout=-1)
+    finding_id = store.insert_finding(
+        conn, fingerprint="fp-flaky", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="fp-flaky",
+    )
+    session_id = store.upsert_session(
+        conn, session_id=None, finding_id=finding_id, devin_session_id="d-flaky",
+        devin_url="https://app.devin.ai/sessions/d-flaky", state="working",
+    )
+
+    result = await orch._poll_to_terminal(session_id, "d-flaky")
+
+    assert result["state"] == "needs_human"
+    assert len(fake.messages_sent) == 1  # nudged once, never re-nudged after an error
+    assert fake.terminated == [("d-flaky", True)]
+
+
+@pytest.mark.asyncio
+async def test_poll_propagates_non_retriable_api_errors(conn, monkeypatch):
+    from devin import DevinAPIError
+
+    class FailingDevinClient(FakeDevinClient):
+        async def get_session(self, session_id):
+            raise DevinAPIError(401, "unauthorized")
+
+    orch = orchestrator.Orchestrator(
+        devin_client=FailingDevinClient([]), conn=conn, repo="x/y", poll_interval=0)
+
+    with pytest.raises(DevinAPIError):
+        await orch._poll_to_terminal("s-1", "d-1")

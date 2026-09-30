@@ -436,30 +436,7 @@ def _insert_working_session(conn, fingerprint, devin_session_id):
 
 
 @pytest.mark.asyncio
-async def test_resume_session_retries_retriable_api_errors_until_terminal(monkeypatch, fresh_conn):
-    finding_id, session_id = _insert_working_session(fresh_conn, "fp-flaky", "devin-flaky")
-    fake_devin = FakeDevinClientForRecovery({
-        "devin-flaky": [
-            DevinAPIError(500, "boom"),
-            DevinAPIError(429, "slow down"),
-            {"status": "running", "status_detail": "working",
-             "structured_output": {"status": "not_applicable"}, "pull_requests": []},
-        ],
-    })
-    monkeypatch.setattr(main, "_orchestrator", Orchestrator(
-        devin_client=fake_devin, conn=fresh_conn, repo="x/y", poll_interval=0,
-    ))
-    monkeypatch.setattr(main, "RESUME_RETRY_INITIAL_SECONDS", 0)
-
-    await asyncio.gather(*main._recover_in_flight())
-
-    assert store.get_session(fresh_conn, session_id)["state"] == "not_applicable"
-    assert store.get_finding(fresh_conn, finding_id)["status"] == "not_applicable"
-    assert fake_devin.terminated == ["devin-flaky"]
-
-
-@pytest.mark.asyncio
-async def test_resume_session_marks_needs_human_on_non_retriable_api_error(monkeypatch, fresh_conn):
+async def test_resume_session_leaves_session_for_next_restart_on_auth_error(monkeypatch, fresh_conn):
     finding_id, session_id = _insert_working_session(fresh_conn, "fp-unauth", "devin-unauth")
     fake_devin = FakeDevinClientForRecovery({"devin-unauth": DevinAPIError(401, "unauthorized")})
     monkeypatch.setattr(main, "_orchestrator", Orchestrator(
@@ -468,8 +445,10 @@ async def test_resume_session_marks_needs_human_on_non_retriable_api_error(monke
 
     await asyncio.gather(*main._recover_in_flight())
 
+    # The Devin session is very likely still running - stay resumable rather
+    # than recording a terminal state we have no evidence for.
     row = store.get_session(fresh_conn, session_id)
-    assert row["state"] == "needs_human"
-    assert row["terminal_at"] is not None
-    assert store.get_finding(fresh_conn, finding_id)["status"] == "needs_human"
-    assert store.list_non_terminal_sessions(fresh_conn) == []
+    assert row["state"] == "working"
+    assert row["terminal_at"] is None
+    assert store.get_finding(fresh_conn, finding_id)["status"] == "dispatching"
+    assert [r["id"] for r in store.list_non_terminal_sessions(fresh_conn)] == [session_id]
