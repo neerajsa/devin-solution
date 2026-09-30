@@ -176,8 +176,9 @@ class Orchestrator:
                 # timeout (session_timeout_seconds). A capped retry count here
                 # would just be a second, arbitrary policy for the same
                 # situation - and real incident 2026-08-19 showed exactly why
-                # giving up early is the wrong trade: a single httpx.ReadTimeout mid-poll orphaned a
-                # healthy, already-running flask session for hours. A real,
+                # giving up early is the wrong trade: a single httpx.ReadTimeout
+                # mid-poll orphaned a healthy, already-running flask session for
+                # hours. A real,
                 # non-transient failure (DevinAPIError - 401/404/500) is
                 # informative and still propagates immediately, unchanged.
                 logger.warning("transient network error polling session %s - retrying", devin_session_id)
