@@ -44,7 +44,10 @@ os.makedirs("data", exist_ok=True)
 _conn = store.connect("data/pipeline.db")
 _devin_client = DevinClient(api_key=_cfg.devin_api_key, org_id=_cfg.devin_org_id)
 _github_client = GitHubClient(token=_cfg.github_token, repo=_cfg.github_repo)
-_orchestrator = Orchestrator(devin_client=_devin_client, conn=_conn, repo=_cfg.github_repo)
+_orchestrator = Orchestrator(
+    devin_client=_devin_client, conn=_conn, repo=_cfg.github_repo,
+    session_timeout_seconds=_cfg.session_timeout_seconds,
+)
 
 app.state.conn = _conn
 app.state.webhook_secret = _cfg.webhook_secret

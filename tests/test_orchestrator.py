@@ -326,6 +326,86 @@ async def test_poll_still_propagates_a_real_non_transient_api_error(conn):
     assert fake.terminated == []
 
 
+# --- Overall session timeout ---
+
+@pytest.mark.asyncio
+async def test_poll_times_out_a_session_stuck_working(conn):
+    fake = FakeDevinClient([
+        {"status": "running", "status_detail": "working", "structured_output": None,
+         "pull_requests": [], "acus_consumed": 3},
+    ])
+    orch = orchestrator.Orchestrator(
+        devin_client=fake, conn=conn, repo="x/y", poll_interval=0.01, session_timeout_seconds=0.05,
+    )
+
+    finding = _cve_finding()
+    result = await orch.dispatch(finding, run_id="run-1", issue_number=7)
+
+    assert result["state"] == "timed_out"
+    assert fake.terminated == [("devin-1", True)]
+    assert fake.reviews_triggered == []
+    row = store.get_session(conn, result["session_id"])
+    assert row["state"] == "timed_out"
+    assert row["terminal_at"] is not None
+    assert row["acu_used"] == 3
+    assert store.get_finding_by_fingerprint(conn, finding.fingerprint)["status"] == "timed_out"
+
+
+@pytest.mark.asyncio
+async def test_poll_times_out_a_session_stuck_on_transport_errors(conn):
+    class AlwaysFlakyDevinClient(FakeDevinClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.get_calls = 0
+
+        async def get_session(self, session_id):
+            self.get_calls += 1
+            raise httpx.ConnectError("simulated permanent outage")
+
+    fake = AlwaysFlakyDevinClient([{}])
+    orch = orchestrator.Orchestrator(
+        devin_client=fake, conn=conn, repo="x/y", poll_interval=0.01, session_timeout_seconds=0.05,
+    )
+
+    finding = _cve_finding()
+    result = await orch.dispatch(finding, run_id="run-1", issue_number=7)
+
+    assert result["state"] == "timed_out"
+    assert result["pr_url"] is None
+    assert fake.get_calls > 1
+    assert fake.terminated == [("devin-1", True)]
+    row = store.get_session(conn, result["session_id"])
+    assert row["state"] == "timed_out"
+    assert row["terminal_at"] is not None
+    assert store.get_finding_by_fingerprint(conn, finding.fingerprint)["status"] == "timed_out"
+
+
+@pytest.mark.asyncio
+async def test_session_timeout_spans_working_and_transport_error_polls(conn):
+    # Elapsed time is tracked across both retry branches, so alternating
+    # between them can't reset the clock.
+    class AlternatingDevinClient(FakeDevinClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.get_calls = 0
+
+        async def get_session(self, session_id):
+            self.get_calls += 1
+            if self.get_calls % 2:
+                raise httpx.ReadTimeout("simulated blip")
+            return {"status": "running", "status_detail": "working", "pull_requests": []}
+
+    fake = AlternatingDevinClient([{}])
+    orch = orchestrator.Orchestrator(
+        devin_client=fake, conn=conn, repo="x/y", poll_interval=0.01, session_timeout_seconds=0.05,
+    )
+
+    result = await orch.dispatch(_cve_finding(), run_id="run-1", issue_number=7)
+
+    assert result["state"] == "timed_out"
+    assert fake.terminated == [("devin-1", True)]
+
+
 @pytest.mark.asyncio
 async def test_terminate_failure_does_not_block_recording_the_outcome(conn):
     class FailsToTerminateDevinClient(FakeDevinClient):

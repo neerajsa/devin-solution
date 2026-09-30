@@ -140,3 +140,20 @@ def test_dashboard_shows_dash_for_finding_with_no_sessions_yet(conn, client):
     resp = client.get("/dashboard", params={"token": "test-secret"})
     assert resp.status_code == 200
     assert "f-brand-new" in resp.text
+
+
+def test_dashboard_renders_timed_out_session_state(conn, client):
+    fid = store.insert_finding(
+        conn, fingerprint="f-timed-out", source="pip-audit", finding_class="dependency-cve",
+        severity="unrated", summary="stuck session",
+    )
+    store.update_finding_status(conn, fid, "timed_out")
+    store.upsert_session(
+        conn, session_id=None, finding_id=fid, devin_session_id="d-to",
+        devin_url="https://app.devin.ai/sessions/d-to", state="timed_out", terminal=True,
+    )
+
+    resp = client.get("/dashboard", params={"token": "test-secret"})
+    assert resp.status_code == 200
+    assert 'class="status-chip timed_out"' in resp.text
+    assert "<span>timed_out</span>" in resp.text

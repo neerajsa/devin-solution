@@ -211,3 +211,20 @@ def test_latency_percentiles_hours_saved_floors_at_zero_when_slower_than_baselin
     _session_row(conn, state="remediated", duration_seconds=200 * 60)
     result = metrics.latency_percentiles(conn)
     assert result["est_human_hours_saved"] == 0.0
+
+
+def test_failure_taxonomy_counts_timed_out_sessions(conn):
+    _add_session(conn, state="timed_out")
+    _add_session(conn, state="needs_human")
+
+    counts = metrics.failure_taxonomy(conn)
+
+    assert counts["timed_out"] == 1
+    assert counts["needs_human"] == 1
+
+
+def test_autonomy_rate_counts_a_timed_out_session_against_it(conn):
+    _add_session(conn, state="remediated")
+    _add_session(conn, state="timed_out")
+
+    assert metrics.autonomy_rate(conn) == 0.5

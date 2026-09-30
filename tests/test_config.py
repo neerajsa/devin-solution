@@ -61,3 +61,17 @@ def test_scan_interval_is_overridable(monkeypatch):
     monkeypatch.setenv("SCAN_INTERVAL_SECONDS", "300")
 
     assert config.load().scan_interval_seconds == 300
+
+
+def test_session_timeout_defaults_when_unset(monkeypatch):
+    _set_all(monkeypatch)
+    monkeypatch.delenv("SESSION_TIMEOUT_SECONDS", raising=False)
+
+    assert config.load().session_timeout_seconds == config.DEFAULT_SESSION_TIMEOUT_SECONDS
+
+
+def test_session_timeout_is_overridable(monkeypatch):
+    _set_all(monkeypatch)
+    monkeypatch.setenv("SESSION_TIMEOUT_SECONDS", "600")
+
+    assert config.load().session_timeout_seconds == 600
