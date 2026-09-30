@@ -12,7 +12,7 @@ import statistics
 SUCCESSFUL_STATES = {"remediated", "partially_remediated", "not_applicable"}
 PR_BACKED_STATES = {"remediated", "partially_remediated"}
 CI_VERIFIED_STATES: set[str] = set()  # kept as a named constant; see first_pass_ci_rate's docstring
-FAILURE_STATES = ["blocked", "no_pr", "needs_human"]
+FAILURE_STATES = ["blocked", "no_pr", "needs_human", "timed_out"]
 
 # --- Part 1: cost-estimation heuristic (docs/observability-improvement-proposal.md) ---
 # HEURISTIC ONLY - not real billing data. acus_consumed is confirmed structurally

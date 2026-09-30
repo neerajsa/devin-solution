@@ -26,6 +26,7 @@ import time
 
 import httpx
 
+import config
 import prompts
 import store
 from devin import DevinClient
@@ -78,7 +79,8 @@ def resolve(session: dict) -> tuple[str, str | None]:
 class Orchestrator:
     def __init__(self, *, devin_client: DevinClient, conn, repo: str, branch: str = "master",
                  max_concurrent: int = 4, max_acu_limit: int = 20,
-                 poll_interval: float = 15, blocked_nudge_timeout: float = 300):
+                 poll_interval: float = 15, blocked_nudge_timeout: float = 300,
+                 session_timeout_seconds: float = config.DEFAULT_SESSION_TIMEOUT_SECONDS):
         self._devin = devin_client
         self._conn = conn
         self._repo = repo
@@ -86,6 +88,7 @@ class Orchestrator:
         self._max_acu_limit = max_acu_limit
         self._poll_interval = poll_interval
         self._blocked_nudge_timeout = blocked_nudge_timeout
+        self._session_timeout_seconds = session_timeout_seconds
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def dispatch(self, finding: Finding, *, run_id: str, issue_number: int) -> dict:
@@ -157,6 +160,8 @@ class Orchestrator:
     async def _poll_to_terminal(self, session_id: str, devin_session_id: str) -> dict:
         nudged_at: float | None = None
         human_messages_sent = 0
+        started_at = time.monotonic()
+        last_raw: dict = {}
 
         while True:
             try:
@@ -166,22 +171,32 @@ class Orchestrator:
                 # session's real state - it isn't "working" and it isn't
                 # terminal, it's just "we don't know right now." That's the
                 # same epistemic position as the "working" branch below, which
-                # already retries forever with no cap because there's no
-                # principled cutoff for "how long is too long to still be
-                # working." A capped retry count here would just be a second,
-                # arbitrary policy for the same situation - and real incident
-                # 2026-08-19 showed exactly why giving up early is the wrong
-                # trade: a single httpx.ReadTimeout mid-poll orphaned a
-                # healthy, already-running flask session for hours. A real,
+                # has no attempt cap because there's no principled per-poll
+                # cutoff - both are bounded only by the overall session
+                # timeout (session_timeout_seconds). A capped retry count here
+                # would just be a second, arbitrary policy for the same
+                # situation - and real incident 2026-08-19 showed exactly why
+                # giving up early is the wrong trade: a single httpx.ReadTimeout
+                # mid-poll orphaned a healthy, already-running flask session for
+                # hours. A real,
                 # non-transient failure (DevinAPIError - 401/404/500) is
                 # informative and still propagates immediately, unchanged.
                 logger.warning("transient network error polling session %s - retrying", devin_session_id)
+                if self._session_timed_out(started_at):
+                    return await self._finish_timed_out(
+                        session_id, devin_session_id, last_raw, human_messages_sent,
+                    )
                 await asyncio.sleep(self._poll_interval)
                 continue
 
+            last_raw = raw
             state, pr_url = resolve(raw)
 
             if state == "working":
+                if self._session_timed_out(started_at):
+                    return await self._finish_timed_out(
+                        session_id, devin_session_id, raw, human_messages_sent,
+                    )
                 await asyncio.sleep(self._poll_interval)
                 continue
 
@@ -227,6 +242,21 @@ class Orchestrator:
                 human_messages_sent=human_messages_sent,
                 acu_used=raw.get("acus_consumed") or 0,
             )
+
+    def _session_timed_out(self, started_at: float) -> bool:
+        return time.monotonic() - started_at >= self._session_timeout_seconds
+
+    async def _finish_timed_out(self, session_id: str, devin_session_id: str, raw: dict,
+                                human_messages_sent: int) -> dict:
+        logger.warning("session %s exceeded %ss timeout - terminating as timed_out",
+                       devin_session_id, self._session_timeout_seconds)
+        _, pr_url = resolve(raw) if raw else (None, None)
+        return await self._finish(
+            session_id, devin_session_id, state="timed_out", pr_url=pr_url,
+            structured_output=raw.get("structured_output"),
+            human_messages_sent=human_messages_sent,
+            acu_used=raw.get("acus_consumed") or 0,
+        )
 
     async def _finish(self, session_id: str, devin_session_id: str, *, state: str,
                        pr_url: str | None, structured_output: dict | None,
